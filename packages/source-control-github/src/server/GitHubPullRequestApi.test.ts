@@ -10,6 +10,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Redacted from "effect/Redacted";
+import { SourceControlProviderKind } from "@t3tools/contracts";
 
 import { HttpClient, HttpClientResponse } from "effect/http";
 
@@ -700,6 +701,107 @@ it.effect(
         accountId: "123",
         viewer: "same-account",
       });
+    }),
+);
+
+it.effect.each([
+  { expired: false, allowPaused: false },
+  { expired: true, allowPaused: false },
+  { expired: false, allowPaused: true },
+  { expired: true, allowPaused: true },
+  { expired: false, allowPaused: undefined },
+  { expired: true, allowPaused: undefined },
+])(
+  "honors credential pauses for identity lookups: expired $expired, allowPaused $allowPaused",
+  ({ expired, allowPaused }) =>
+    Effect.gen(function* () {
+      const limits = yield* SourceControlRateLimit.make;
+      const requests: string[] = [];
+      const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+        get: (host, repository) =>
+          Effect.succeed({
+            host,
+            token: Redacted.make(`test-${repository}`),
+            source: "git" as const,
+            fingerprint: `pat:${repository}`,
+          }),
+        invalidate: () => Effect.void,
+      });
+      const http = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.sync(() => {
+            requests.push(request.headers.authorization!);
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response('{"id":123,"login":"same-account"}', {
+                headers: { "content-type": "application/json" },
+              }),
+            );
+          }),
+        ),
+      );
+      const cli = yield* GitHubPullRequestApi.make.pipe(
+        Effect.provide(
+          GitHubRest.layer.pipe(
+            Layer.provideMerge(Layer.mergeAll(credentials, http)),
+            Layer.provideMerge(GitHubQuota.layer),
+            Layer.provideMerge(
+              Layer.succeed(SourceControlRateLimit.SourceControlRateLimit, limits),
+            ),
+            Layer.merge(TestSourceControlHost.layer()),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      );
+      const input = { cwd: "/repo", host: "github.com", repository: "owner-a/repo" };
+      if (expired) {
+        yield* cli.withVerifiedCredential(input, Effect.succeed);
+        yield* TestClock.adjust("10 minutes");
+      }
+      requests.length = 0;
+      const key = { provider: SourceControlProviderKind.make("github"), host: input.host };
+      const now = yield* Clock.currentTimeMillis;
+      yield* Effect.gen(function* () {
+        const lease = yield* limits.check(key);
+        yield* limits.recordRateLimit({ ...key, lease, retryAt: now + 60 * 60_000 });
+      }).pipe(Effect.provideService(SourceControlRateLimit.CredentialScope, "pat:owner-a/repo"));
+
+      const result = yield* cli
+        .withVerifiedCredential(
+          { ...input, ...(allowPaused === undefined ? {} : { allowPaused }) },
+          Effect.succeed,
+        )
+        .pipe(Effect.result);
+      if (allowPaused === false) {
+        assert.ok(Result.isFailure(result));
+        expect(result.failure._tag).toBe("SourceControlRateLimitPausedError");
+        expect(requests).toEqual([]);
+        const other = yield* cli.withVerifiedCredential(
+          { ...input, repository: "owner-b/repo", allowPaused: false },
+          Effect.succeed,
+        );
+        expect(other.credentialFingerprint).toBe("pat:owner-b/repo");
+        expect(requests).toEqual(["Bearer test-owner-b/repo"]);
+      } else {
+        assert.ok(Result.isSuccess(result));
+        expect(result.success.viewer).toBe("same-account");
+        expect(requests).toEqual(["Bearer test-owner-a/repo"]);
+        requests.length = 0;
+        const cached = yield* cli.withVerifiedCredential(
+          { ...input, allowPaused: false },
+          Effect.succeed,
+        );
+        expect(cached).toEqual(result.success);
+        expect(requests).toEqual([]);
+        const paused = yield* limits
+          .check(key)
+          .pipe(
+            Effect.provideService(SourceControlRateLimit.CredentialScope, "pat:owner-a/repo"),
+            Effect.flip,
+          );
+        expect(paused._tag).toBe("SourceControlRateLimitPausedError");
+      }
     }),
 );
 

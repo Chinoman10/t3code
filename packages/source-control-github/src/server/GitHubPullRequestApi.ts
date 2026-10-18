@@ -397,7 +397,12 @@ export class GitHubPullRequestApi extends Context.Service<
   GitHubPullRequestApi,
   {
     readonly withVerifiedCredential: <A, E, R>(
-      input: { readonly cwd: string; readonly host: string; readonly repository?: string },
+      input: {
+        readonly cwd: string;
+        readonly host: string;
+        readonly repository?: string;
+        readonly allowPaused?: boolean;
+      },
       use: (identity: {
         readonly accountId: string;
         readonly viewer: string;
@@ -927,6 +932,7 @@ export const make = Effect.gen(function* () {
       readonly cwd: string;
       readonly host: string;
       readonly repository?: string;
+      readonly allowPaused?: boolean;
     }) {
       const unavailable = () => new GitHubViewerLoginUnavailableError({ cwd: input.cwd });
       const host = input.host.toLowerCase();
@@ -967,7 +973,7 @@ export const make = Effect.gen(function* () {
                   ...(input.repository === undefined ? {} : { repository: input.repository }),
                   operation: "getRoutingIdentity",
                   path: "user",
-                  allowReserve: true,
+                  allowReserve: input.allowPaused !== false,
                 })
                 .pipe(
                   Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, credential),

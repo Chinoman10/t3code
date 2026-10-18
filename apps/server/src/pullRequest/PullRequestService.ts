@@ -616,6 +616,7 @@ export const make = Effect.gen(function* () {
   const withProjectCredential = <A, E, R>(
     project: SupportedProject,
     read: Effect.Effect<A, E, R>,
+    allowPaused = true,
   ) => {
     if (!hasRepositoryCredential(project)) return read;
     return project.api.withVerifiedCredential!(
@@ -623,6 +624,7 @@ export const make = Effect.gen(function* () {
         cwd: project.project.workspaceRoot,
         host: project.host,
         repository: providerRepository(project),
+        allowPaused,
       },
       (identity) => read.pipe(Effect.provideService(routingCredential, identity), Effect.result),
     ).pipe(Effect.mapError(toPullRequestError("routeIdentity")), Effect.flatMap(Effect.fromResult));
@@ -1063,6 +1065,7 @@ export const make = Effect.gen(function* () {
               cwd: project.project.workspaceRoot,
               host: project.host,
               repository: providerRepository(project),
+              allowPaused: options?.allowPaused === true,
             },
             (identity) =>
               Effect.succeed<ResolvedViewer>({
@@ -1290,6 +1293,7 @@ export const make = Effect.gen(function* () {
                     cursor: { updatedBefore: cursor.updatedBefore, delivered: cursor.delivered },
                   }),
             }),
+            false,
           ).pipe(
             observeRead,
             Effect.map(({ value: page, observedAt }): RepositoryBatch => {

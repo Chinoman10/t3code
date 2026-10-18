@@ -1581,6 +1581,127 @@ it.effect(
     ),
 );
 
+it.effect("pauses repository viewer discovery while preserving interactive credential paths", () =>
+  Effect.gen(function* () {
+    const limits = yield* SourceControlRateLimit.make;
+    const requests: string[] = [];
+    const pauseModes: Array<boolean | undefined> = [];
+    let expireAfterViewer = false;
+    const key = { provider: SourceControlProviderKind.make("github"), host: "github.com" };
+    const pause = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const lease = yield* limits.check(key, { allowPaused: true });
+      yield* limits.recordRateLimit({ ...key, lease, retryAt: now + 60 * 60_000 });
+    }).pipe(
+      Effect.provideService(SourceControlRateLimit.CredentialScope, "pat:owner/repo"),
+      Effect.orDie,
+    );
+    const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+      get: (host) =>
+        Effect.succeed({
+          host,
+          token: Redacted.make("test-credential"),
+          source: "git" as const,
+          repository: "owner/repo",
+          credentialRepository: "Owner/Repo",
+          fingerprint: "pat:owner/repo",
+        }),
+      invalidate: () => Effect.void,
+    });
+    const http = Layer.succeed(
+      HttpClient.HttpClient,
+      HttpClient.make((request) =>
+        Effect.sync(() => {
+          requests.push(request.url);
+          return HttpClientResponse.fromWeb(
+            request,
+            new Response('{"id":123,"login":"octocat"}', {
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }),
+      ),
+    );
+    const native = yield* GitHubPullRequestProvider.make.pipe(
+      Effect.provide(
+        GitHubPullRequestApi.layer.pipe(
+          Layer.provide(
+            GitHubRest.layer.pipe(
+              Layer.provideMerge(Layer.mergeAll(credentials, http)),
+              Layer.provideMerge(GitHubQuota.layer),
+              Layer.provideMerge(
+                Layer.succeed(SourceControlRateLimit.SourceControlRateLimit, limits),
+              ),
+            ),
+          ),
+          Layer.provide(TestSourceControlHost.layer()),
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    );
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "A", workspaceRoot: "/a", repository: "Owner/Repo" })],
+      providers: [
+        fakeProvider(SourceControlProviderKind.make("github"), {
+          capabilities: { ...native.capabilities, viewedFiles: "environment" },
+          withVerifiedCredential: (input, use) => {
+            pauseModes.push(input.allowPaused);
+            return native.withVerifiedCredential!(input, (identity) =>
+              use(identity).pipe(
+                Effect.tap(() => {
+                  if (!expireAfterViewer) return Effect.void;
+                  expireAfterViewer = false;
+                  return TestClock.adjust("10 minutes").pipe(Effect.andThen(pause));
+                }),
+              ),
+            );
+          },
+          listChangeRequests: () =>
+            Effect.succeed({
+              items: [changeRequest(1, "2026-07-02T00:00:00Z")],
+              truncated: false,
+              continues: true,
+            }),
+          getChangeRequest: () => Effect.succeed(hostedChangeRequest("interactive detail")),
+        }),
+      ],
+    });
+    yield* pause;
+
+    const cold = yield* service.list({ state: "open" }).pipe(Effect.flip);
+    assert.strictEqual(cold._tag, "PullRequestOperationError");
+    assert.match(cold.message, /paused until the rate limit resets/u);
+    assert.deepStrictEqual(requests, []);
+    assert.deepStrictEqual(pauseModes, [false]);
+    const ref = { projectId: "p1" as ProjectId, repository: "Owner/Repo", number: 1 };
+    assert.strictEqual((yield* service.detail(ref)).body, "interactive detail");
+    assert.deepStrictEqual(pauseModes, [false, true]);
+    assert.deepStrictEqual(requests, ["https://api.github.com/user"]);
+    assert.strictEqual((yield* service.list({ state: "open" })).entries.length, 1);
+    assert.strictEqual(requests.length, 1);
+
+    yield* TestClock.adjust("10 minutes");
+    const expired = yield* service.list({ state: "open" }).pipe(Effect.flip);
+    assert.strictEqual(expired._tag, "PullRequestOperationError");
+    assert.match(expired.message, /paused until the rate limit resets/u);
+    assert.strictEqual(requests.length, 1);
+    pauseModes.length = 0;
+    assert.deepStrictEqual(yield* service.filesViewed(ref), { files: [], truncated: false });
+    assert.deepStrictEqual(pauseModes, [true, true]);
+    assert.strictEqual(requests.length, 2);
+
+    pauseModes.length = 0;
+    expireAfterViewer = true;
+    const queued = yield* service.list({ state: "open" });
+    assert.strictEqual(queued.entries.length, 0);
+    assert.strictEqual(queued.errors.length, 1);
+    assert.deepStrictEqual(pauseModes, [false, false]);
+    assert.strictEqual(requests.length, 2);
+  }).pipe(
+    Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+  ),
+);
+
 it.effect.each([
   { remoteUrl: "https://github.com/OwnerA/Repo.git", enabled: false },
   { remoteUrl: "https://evil.example/OwnerA/Repo.git", enabled: true },
