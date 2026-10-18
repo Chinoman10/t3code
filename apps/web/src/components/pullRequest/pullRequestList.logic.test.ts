@@ -15,6 +15,7 @@ import {
   findScopedProject,
   mergePullRequestLists,
   pullRequestEntryKey,
+  pullRequestEntryViewer,
   pullRequestEnvironmentSetKey,
   groupPullRequestsByInvolvement,
   matchesPullRequestFilters,
@@ -1315,6 +1316,117 @@ describe('who "I" am, per server', () => {
         "authored",
       ).map((row) => row.number),
     ).toEqual([1]);
+  });
+
+  it("keeps each repository's viewer through environment merging, grouping, filters and snapshots", () => {
+    const rows = [
+      entry({
+        number: 1,
+        repository: "OwnerA/Repo",
+        author: { login: "Alice", name: null, avatarUrl: null },
+      }),
+      entry({
+        number: 2,
+        repository: "OwnerB/Repo",
+        author: { login: "Bob", name: null, avatarUrl: null },
+      }),
+    ];
+    const merged = mergePullRequestLists([
+      [
+        ENV_1,
+        answer(
+          {
+            "github.com": "Alice",
+            "github.com ownera/repo": "Alice",
+            "github.com ownerb/repo": "Bob",
+          },
+          rows,
+        ),
+      ],
+      [
+        ENV_2,
+        answer(
+          {
+            "github.com": "Alice",
+            "github.com ownera/repo": "Carol",
+            "github.com ownerb/repo": "Dave",
+          },
+          rows,
+        ),
+      ],
+    ])!;
+    const storage = new Map<string, string>();
+    const snapshotStorage = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      },
+    };
+    writePullRequestListSnapshot(snapshotStorage, "both", { scope: "both", data: merged });
+    const restored = readPullRequestListSnapshot(snapshotStorage, "both")!.data;
+    expect(restored.viewers).toEqual(merged.viewers);
+    expect(
+      filterPullRequestsByInvolvement(restored.entries, restored.viewers, "authored").map((row) => [
+        row.environmentId,
+        row.number,
+      ]),
+    ).toEqual([
+      [ENV_1, 1],
+      [ENV_1, 2],
+    ]);
+    expect(
+      groupPullRequestsByInvolvement(restored.entries, restored.viewers)
+        .find((group) => group.key === "authored")
+        ?.entries.map((row) => [row.environmentId, row.number]),
+    ).toEqual([
+      [ENV_1, 1],
+      [ENV_1, 2],
+    ]);
+    for (const author of ["me", "@me"]) {
+      expect(
+        restored.entries
+          .filter((row) =>
+            matchesPullRequestFilters(
+              row,
+              { author },
+              pullRequestEntryViewer(row, restored.viewers),
+            ),
+          )
+          .map((row) => [row.environmentId, row.number]),
+      ).toEqual([
+        [ENV_1, 1],
+        [ENV_1, 2],
+      ]);
+    }
+  });
+
+  it.each([
+    [
+      {
+        [`${ENV_1} github.com ownera/repo`]: "Scoped",
+        [`${ENV_1} github.com`]: "Environment",
+        "github.com ownera/repo": "Repository",
+        "github.com": "Host",
+      },
+      "scoped",
+    ],
+    [
+      {
+        [`${ENV_1} github.com`]: "Environment",
+        "github.com ownera/repo": "Repository",
+        "github.com": "Host",
+      },
+      "environment",
+    ],
+    [{ "github.com ownera/repo": "Repository", "github.com": "Host" }, "repository"],
+    [{ "github.com": "Host" }, "host"],
+  ] as const)("prefers the most specific available viewer: %s", (viewers, expected) => {
+    expect(
+      pullRequestEntryViewer(
+        { ...entry({ number: 1, repository: "OwnerA/Repo" }), environmentId: ENV_1 },
+        viewers,
+      ),
+    ).toBe(expected);
   });
 
   it("names the servers with more rows and no cursor to reach them by", () => {

@@ -14,6 +14,120 @@ const asset = (url: string) => ({
 });
 
 describe("repository GitHub media credentials", () => {
+  it.effect.each([
+    { fallback: false, enabled: true, unsupportedPrefix: false },
+    { fallback: true, enabled: true, unsupportedPrefix: false },
+    { fallback: true, enabled: false, unsupportedPrefix: false },
+    { fallback: true, enabled: true, unsupportedPrefix: true },
+  ])(
+    "uses LFS repository context through redirects: fallback $fallback, opt-in $enabled, unsupported prefix $unsupportedPrefix",
+    ({ fallback, enabled, unsupportedPrefix }) => {
+      const scopes: Array<string | undefined> = [];
+      const authorizations: Array<string | undefined> = [];
+      const redirects = [
+        "https://raw.githubusercontent.com/OwnerA/Repo/main/image.png",
+        "https://media.githubusercontent.com/media/ownera/repo/main/image.png",
+        unsupportedPrefix
+          ? "https://media.githubusercontent.com/OwnerA/Repo/main/image.png"
+          : "https://media.githubusercontent.com/media/OwnerB/Repo/main/image.png",
+      ];
+      return Effect.gen(function* () {
+        const response = yield* githubMediaResponse(
+          asset("https://media.githubusercontent.com/media/OwnerA/Repo/main/image.png"),
+          {},
+        );
+        expect(response.status).toBe(200);
+        expect(scopes).toEqual(["OwnerA/Repo"]);
+        expect(authorizations).toEqual([
+          "Bearer fake-owner-a",
+          "Bearer fake-owner-a",
+          "Bearer fake-owner-a",
+          enabled ? undefined : "Bearer fake-owner-a",
+        ]);
+      }).pipe(
+        Effect.provide(
+          Layer.mock(GitHubCredentials.GitHubCredentials)({
+            get: (host, repository) => {
+              scopes.push(repository);
+              return Effect.succeed({
+                host,
+                ...(fallback ? {} : { repository: "ownera/repo" }),
+                source: fallback ? "settings" : "git",
+                fingerprint: "fake-a",
+                token: Redacted.make("fake-owner-a"),
+              });
+            },
+          }),
+        ),
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) => {
+            const location = redirects[authorizations.length];
+            authorizations.push(request.headers.authorization);
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                new Response(null, {
+                  status: location === undefined ? 200 : 302,
+                  headers: location === undefined ? { "content-type": "image/png" } : { location },
+                }),
+              ),
+            );
+          }),
+        ),
+        Effect.provideService(HostProcess.Environment, {
+          T3CODE_GITHUB_USE_GIT_CREDENTIALS: enabled ? "1" : "0",
+        }),
+        Effect.scoped,
+      );
+    },
+  );
+
+  it.effect.each([
+    { path: "raw.githubusercontent.com/media/Repo/main/image.png", repository: "media/Repo" },
+    { path: "media.githubusercontent.com/OwnerA/Repo/main/image.png", repository: undefined },
+    { path: "media.githubusercontent.com/Media/OwnerA/Repo/main/image.png", repository: undefined },
+    { path: "media.githubusercontent.com/media/OwnerA/Repo", repository: undefined },
+    { path: "media.githubusercontent.com/media//Repo/main/image.png", repository: undefined },
+    {
+      path: "media.githubusercontent.com/media/Owner%2FA/Repo/main/image.png",
+      repository: undefined,
+    },
+    {
+      path: "media.githubusercontent.com/media/OwnerA/-Repo/main/image.png",
+      repository: undefined,
+    },
+  ])("requires the LFS prefix only on its own host: $path", ({ path, repository }) =>
+    Effect.gen(function* () {
+      yield* githubMediaResponse(asset(`https://${path}`), {});
+    }).pipe(
+      Effect.provide(
+        Layer.mock(GitHubCredentials.GitHubCredentials)({
+          get: (host, selected) => {
+            expect(selected).toBe(repository);
+            return Effect.succeed({
+              host,
+              source: "settings",
+              fingerprint: "default",
+              token: Redacted.make("fake-default"),
+            });
+          },
+        }),
+      ),
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make((request) => {
+          expect(request.headers.authorization).toBe("Bearer fake-default");
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, new Response(null, { status: 404 })),
+          );
+        }),
+      ),
+      Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+      Effect.scoped,
+    ),
+  );
+
   it.effect.each([true, false])(
     "keeps legacy fallback redirect behavior only with opt-in disabled: %s",
     (enabled) => {

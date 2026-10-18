@@ -1187,7 +1187,11 @@ export const make = Effect.gen(function* () {
       const viewerResults = yield* resolveViewers(projects, viewerRoots);
       const viewers: Record<string, string> = {};
       for (const result of viewerResults) {
-        if (result.viewer !== null) viewers[result.host] = result.viewer;
+        if (result.viewer === null) continue;
+        if (result.repository !== undefined)
+          viewers[listCursorKey(result.host, result.repository)] = result.viewer;
+        if (result.repository === undefined || viewers[result.host] === undefined)
+          viewers[result.host] = result.viewer;
       }
 
       const providers: ReadonlyArray<PullRequestProviderSummary> = [

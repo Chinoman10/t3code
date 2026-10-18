@@ -1665,9 +1665,76 @@ it.effect("keeps opted-in repository viewers and list searches separate for one 
       ["OwnerB/Repo"],
     );
     assert.strictEqual(next.errors.length, 1);
+    assert.deepStrictEqual(next.viewers, {
+      "github.com": "Chinoman10",
+      "github.com ownerb/repo": "Chinoman10",
+    });
   }).pipe(
     Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
   ),
+);
+
+it.effect.each([true, false])(
+  "returns repository viewer keys only with Git credentials enabled: %s",
+  (enabled) =>
+    Effect.gen(function* () {
+      let hostLookups = 0;
+      const service = yield* makeService({
+        projects: [
+          project({ id: "p1", title: "A", workspaceRoot: "/a", repository: "OwnerA/Repo" }),
+          project({ id: "p2", title: "B", workspaceRoot: "/b", repository: "OwnerB/Repo" }),
+        ],
+        providers: [
+          fakeProvider(SourceControlProviderKind.make("github"), {
+            getViewer: () =>
+              Effect.sync(() => {
+                hostLookups++;
+                return "host-default";
+              }),
+            withVerifiedCredential: (input, use) =>
+              use({
+                accountId: input.repository === "OwnerA/Repo" ? "1" : "2",
+                viewer: input.repository === "OwnerA/Repo" ? "Alice" : "Bob",
+                credentialFingerprint: `pat:${input.repository}`,
+              }),
+            listChangeRequests: (input) =>
+              Effect.sync(() => {
+                assert.strictEqual(
+                  input.viewer,
+                  enabled ? (input.repository === "OwnerA/Repo" ? "Alice" : "Bob") : "host-default",
+                );
+                return {
+                  items: [
+                    {
+                      ...changeRequest(1, "2026-07-02T00:00:00Z"),
+                      author: { login: input.viewer, name: null, avatarUrl: null },
+                    },
+                  ],
+                  truncated: false,
+                  continues: true,
+                };
+              }),
+          }),
+        ],
+      });
+      const result = yield* service.list({ state: "open", involvement: "authored" });
+      assert.strictEqual(result.entries.length, 2);
+      assert.deepStrictEqual(
+        result.viewers,
+        enabled
+          ? {
+              "github.com": "Alice",
+              "github.com ownera/repo": "Alice",
+              "github.com ownerb/repo": "Bob",
+            }
+          : { "github.com": "host-default" },
+      );
+      assert.strictEqual(hostLookups, enabled ? 0 : 1);
+    }).pipe(
+      Effect.provideService(HostProcess.Environment, {
+        T3CODE_GITHUB_USE_GIT_CREDENTIALS: enabled ? "1" : "0",
+      }),
+    ),
 );
 
 it.effect("namespaces ordinary detail caches by repository PAT without a routing RPC", () =>

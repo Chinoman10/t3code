@@ -54,6 +54,10 @@ const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inlin
 const repositoryOf = (source: string) => {
   const url = new URL(source);
   const parts = url.pathname.split("/");
+  if (url.hostname.toLowerCase() === "media.githubusercontent.com") {
+    if (parts[1] !== "media") return null;
+    parts.splice(1, 1);
+  }
   const repository = `${parts[1]}/${parts[2]}`;
   return isCredentialedHost(source) &&
     parts.length > 3 &&
