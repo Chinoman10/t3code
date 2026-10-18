@@ -38,6 +38,7 @@ import {
   gitHubApiHostForRemote,
   parseFetchRemotes,
   parseGitHubRepositorySelector,
+  parseGitHubRemoteRepositorySelector,
   parsePullRequestReference,
   resolveGitHubRepository,
   type GitHubRepositoryLocator,
@@ -219,6 +220,7 @@ export const makeDiscovery = Effect.gen(function* () {
   const sourceControlHost = yield* SourceControlHost.SourceControlHost;
   const process = sourceControlHost.process;
   const environment = yield* HostProcess.Environment;
+  const workingDirectory = yield* HostProcess.WorkingDirectory;
 
   return {
     type: "managed-cli",
@@ -241,7 +243,42 @@ export const makeDiscovery = Effect.gen(function* () {
       const savedToken = (settings.tokens["github.com"] ?? "").trim() !== "";
       const variable = environmentTokenVariable(environment);
       const tokenSource = savedToken ? "the token saved in Settings" : variable;
-      if (tokenSource === null || settings.hosts["github.com"]?.enabled === false) return cli;
+      const repositoryFallback = (item: SourceControlProviderDiscoveryItem) =>
+        Effect.gen(function* () {
+          if (
+            environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS !== "1" ||
+            item.auth.status === "authenticated"
+          )
+            return item;
+          const available = yield* process
+            .run({
+              operation: "GitHubSourceControlProvider.gitCredentialsDiscovery",
+              command: "git",
+              args: ["--version"],
+              cwd: workingDirectory,
+              timeoutMs: 5_000,
+              maxOutputBytes: 1_024,
+            })
+            .pipe(
+              Effect.as(true),
+              Effect.orElseSucceed(() => false),
+            );
+          return available
+            ? {
+                ...item,
+                status: "available" as const,
+                auth: providerAuth({
+                  status: "unknown",
+                  host: "github.com",
+                  detail:
+                    "Git credentials are resolved per repository. Enter an owner/repository or GitHub URL; host-wide operations still need a default GitHub credential.",
+                }),
+              }
+            : item;
+        });
+      // A host turned off in Settings stays off even with a token.
+      if (settings.hosts["github.com"]?.enabled === false) return cli;
+      if (tokenSource === null) return yield* repositoryFallback(cli);
       const viewer = yield* api
         .rest({ host: "github.com", operation: "discovery", path: "user" })
         .pipe(Effect.result);
@@ -249,7 +286,7 @@ export const makeDiscovery = Effect.gen(function* () {
         ? Option.getOrUndefined(decodeViewer(viewer.success.body))?.login
         : undefined;
       const accounts = cli.auth.accounts === undefined ? {} : { accounts: cli.auth.accounts };
-      return {
+      return yield* repositoryFallback({
         ...cli,
         status: "available" as const,
         auth: {
@@ -277,7 +314,7 @@ export const makeDiscovery = Effect.gen(function* () {
                 })),
           ...accounts,
         },
-      } satisfies SourceControlProviderDiscoveryItem;
+      } satisfies SourceControlProviderDiscoveryItem);
     }),
     /**
      * A host turned off in Settings is claimed too, so its error says so
@@ -345,6 +382,7 @@ function fromGitHubApiError(
     case "GitHubApiNotFoundError":
       return failure(notFound, error);
     case "GitHubCliFailedError":
+    case "GitHubGitCredentialError":
     case "GitHubApiResponseError":
     case "GitHubApiRequestError":
       return failure(error.message.trim() || "GitHub request failed.", error);
@@ -488,14 +526,18 @@ export const make = Effect.gen(function* () {
         resolved: resolved?.exitCode === 0 ? resolved.stdout : "",
         hostHint,
         defaultHost,
+        preserveRepositoryCase: environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS === "1",
       });
       if (locator !== null) return locator;
       if (input.context) {
         const remote = normalizeGitRemoteUrl(input.context.remoteUrl);
-        const fallback = parseGitHubRepositorySelector(
-          `${host}/${remote.slice(remote.indexOf("/") + 1)}`,
-          host,
-        );
+        const fallback =
+          environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS === "1" && host === "github.com"
+            ? parseGitHubRemoteRepositorySelector(input.context.remoteUrl, host)
+            : parseGitHubRepositorySelector(
+                `${host}/${remote.slice(remote.indexOf("/") + 1)}`,
+                host,
+              );
         if (fallback !== null) return fallback;
       }
       return yield* failure(
@@ -519,8 +561,23 @@ export const make = Effect.gen(function* () {
     decodeDetail: string,
     effect: Effect.Effect<A, E, R>,
   ) =>
-    effect.pipe(
-      GitHubGraphQlClient.call(target),
+    Effect.gen(function* () {
+      if (environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS !== "1")
+        return yield* effect.pipe(GitHubGraphQlClient.call(target));
+      const credential = yield* api.credential(target.host, target.repository);
+      return yield* effect.pipe(
+        GitHubGraphQlClient.call(target),
+        Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
+          host: target.host.toLowerCase(),
+          token: credential.token,
+          credentialFingerprint: credential.fingerprint,
+          ...(credential.repository === undefined ? {} : { repository: credential.repository }),
+          ...(credential.credentialRepository === undefined
+            ? {}
+            : { credentialRepository: credential.credentialRepository }),
+        }),
+      );
+    }).pipe(
       Effect.mapError((error) =>
         GraphQLClientError.isGraphQLClientError(error)
           ? failure(decodeDetail, error)
@@ -565,6 +622,7 @@ export const make = Effect.gen(function* () {
     const result = yield* graphqlRead(
       {
         host: locator.host,
+        repository: `${locator.owner}/${locator.name}`,
         operation: "listPullRequestsByHead",
         allowReserve: input.allowReserve,
         // Up to 50 heads of 100 rows each. A default branch such as `main` can match a hundred
@@ -624,7 +682,12 @@ export const make = Effect.gen(function* () {
       const locator = parsed.kind === "url" ? parsed.locator : yield* resolveRepository(input);
       const decodeDetail = "GitHub returned an invalid pull request.";
       const result = yield* graphqlRead(
-        { host: locator.host, operation: "getPullRequest", allowReserve: true },
+        {
+          host: locator.host,
+          repository: `${locator.owner}/${locator.name}`,
+          operation: "getPullRequest",
+          allowReserve: true,
+        },
         decodeDetail,
         client.PullRequestByNumber({
           owner: locator.owner,
@@ -647,6 +710,7 @@ export const make = Effect.gen(function* () {
     const response = yield* rest(
       {
         host: locator.host,
+        repository: `${locator.owner}/${locator.name}`,
         operation: "getRepository",
         path: `repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}`,
         allowReserve: true,
@@ -662,9 +726,11 @@ export const make = Effect.gen(function* () {
 
   const readViewerLogin = Effect.fn("GitHubSourceControlProvider.readViewerLogin")(function* (
     host: string,
+    repository?: string,
   ) {
     const response = yield* rest({
       host,
+      ...(repository === undefined ? {} : { repository }),
       operation: "getViewer",
       path: "user",
       allowReserve: true,
@@ -844,10 +910,12 @@ export const make = Effect.gen(function* () {
   const readLinkSubject = Effect.fn("GitHubSourceControlProvider.readLinkSubject")(function* (
     input: { readonly cwd: string; readonly url: URL },
     endpoint: string,
+    repository: string,
   ) {
     const result = yield* api
       .rest({
         host: input.url.host,
+        repository,
         operation: "resolveLink",
         path: endpoint,
         maxResponseBytes: 1_000_000,
@@ -900,7 +968,11 @@ export const make = Effect.gen(function* () {
         input.url.pathname,
       );
       if (!match) return undefined;
-      return readLinkSubject(input, `repos/${match[1]}/${match[2]}/issues/${match[3]}`);
+      return readLinkSubject(
+        input,
+        `repos/${match[1]}/${match[2]}/issues/${match[3]}`,
+        `${match[1]}/${match[2]}`,
+      );
     },
     listChangeRequests: (input) =>
       (input.state === "open" ? Effect.succeed(true) : SourceControlRateLimit.Interactive).pipe(
@@ -939,6 +1011,7 @@ export const make = Effect.gen(function* () {
           );
         yield* rest({
           host: locator.host,
+          repository: `${locator.owner}/${locator.name}`,
           operation: "createPullRequest",
           method: "POST",
           allowReserve: true,
@@ -983,7 +1056,10 @@ export const make = Effect.gen(function* () {
           input.repository,
           (environment.GH_HOST ?? "github.com").toLowerCase(),
         );
-        const viewer = locator === null ? null : yield* readViewerLogin(locator.host);
+        const viewer =
+          locator === null
+            ? null
+            : yield* readViewerLogin(locator.host, `${locator.owner}/${locator.name}`);
         const owner = locator?.owner ?? viewer;
         const name = locator?.name ?? input.repository.trim();
         const host = locator?.host ?? (environment.GH_HOST?.trim().toLowerCase() || "github.com");
@@ -991,6 +1067,7 @@ export const make = Effect.gen(function* () {
         const response = yield* rest(
           {
             host,
+            ...(locator === null ? {} : { repository: `${locator.owner}/${locator.name}` }),
             operation: "createRepository",
             method: "POST",
             allowReserve: true,

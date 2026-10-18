@@ -1,5 +1,6 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeV8 from "node:v8";
 import * as NodeVM from "node:vm";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -7,6 +8,7 @@ import * as KeyValueStore from "effect/persistence/KeyValueStore";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -37,6 +39,8 @@ import * as SourceControlRateLimit from "@t3tools/source-control-core/server/Sou
 import * as ForgejoCli from "@t3tools/source-control-forgejo/server/ForgejoCli";
 import * as ForgejoPullRequestProvider from "@t3tools/source-control-forgejo/server/ForgejoPullRequestProvider";
 import * as GitHubRest from "@t3tools/source-control-github/server/GitHubRest";
+import * as GitHubRequestPolicy from "@t3tools/source-control-github/server/GitHubRequestPolicy";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as GitHubCredentials from "@t3tools/source-control-github/server/GitHubCredentials";
 import * as GitHubPullRequestApi from "@t3tools/source-control-github/server/GitHubPullRequestApi";
 import * as GitHubPullRequestProvider from "@t3tools/source-control-github/server/GitHubPullRequestProvider";
@@ -1404,6 +1408,312 @@ it.effect("tries another workspace on the same host for the viewer", () =>
     assert.strictEqual(result.entries.length, 2);
     assert.strictEqual(result.viewers["github.com"], "bilal");
   }),
+);
+
+it.effect(
+  "uses original remote spelling for canonical GitHub identities across native credential paths",
+  () =>
+    Effect.gen(function* () {
+      let generation = 1;
+      const helperPaths: string[] = [];
+      const lookups: string[] = [];
+      const requests: Array<{ operation: string; authorization: string | undefined }> = [];
+      const host = TestSourceControlHost.layer({
+        process: {
+          run: (input) =>
+            Effect.sync(() => {
+              const path = /path=(.*)\n/.exec(input.stdin ?? "")?.[1];
+              assert.ok(
+                path === "OwnerA/Repo.git" || path === "ownerb/repo.git",
+                `Unexpected helper selector: ${path}`,
+              );
+              helperPaths.push(path);
+              return {
+                exitCode: ChildProcessSpawner.ExitCode(0),
+                stdout: `protocol=https\nhost=github.com\nusername=Chinoman10\npassword=fake-${path.split("/")[0]}-${generation}\n`,
+                stderr: "",
+                stdoutTruncated: false,
+                stderrTruncated: false,
+              };
+            }),
+        },
+      });
+      const http = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.sync(() => {
+            const operation = request.url.endsWith("/user")
+              ? "user"
+              : request.body._tag === "Uint8Array"
+                ? new TextDecoder().decode(request.body.body)
+                : "";
+            requests.push({ operation, authorization: request.headers.authorization });
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(
+                JSON.stringify(
+                  operation === "user"
+                    ? { id: 101, login: "Chinoman10" }
+                    : {
+                        data: {
+                          repository: { pullRequest: { id: "PR_1" } },
+                          _0_markFileAsViewed: { clientMutationId: null },
+                        },
+                      },
+                ),
+                { headers: { "content-type": "application/json" } },
+              ),
+            );
+          }),
+        ),
+      );
+      const context = yield* Layer.build(
+        GitHubPullRequestApi.layer.pipe(
+          Layer.provideMerge(
+            GitHubRest.layerWithDependencies.pipe(
+              Layer.provideMerge(host),
+              Layer.provideMerge(http),
+              Layer.provide(NodeCrypto.layer),
+            ),
+          ),
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      );
+      const native = yield* GitHubPullRequestProvider.make.pipe(Effect.provideContext(context));
+      const policy = Context.get(context, GitHubRequestPolicy.GitHubRequestPolicy);
+      const credentials = Context.get(context, GitHubCredentials.GitHubCredentials);
+      const lookup = (input: { readonly host: string; readonly repository: string }) => {
+        lookups.push(input.repository);
+        return policy
+          .credential(input.host, input.repository)
+          .pipe(Effect.mapError(() => requestFailed));
+      };
+      const provider = fakeProvider(SourceControlProviderKind.make("github"), {
+        capabilities: {
+          ...fakeProvider(SourceControlProviderKind.make("github")).capabilities,
+          viewedFiles: "host",
+        },
+        withVerifiedCredential: native.withVerifiedCredential!,
+        listChangeRequests: (input) =>
+          lookup(input).pipe(
+            Effect.as({
+              items: [changeRequest(1, "2026-07-02T00:00:00Z")],
+              truncated: false,
+              continues: true,
+            }),
+          ),
+        getChangeRequest: (input) =>
+          lookup(input).pipe(
+            Effect.map((credential) => hostedChangeRequest(Redacted.value(credential.token))),
+          ),
+        listChangeRequestStats: (input) =>
+          Effect.forEach(input.changeRequests, (ref) =>
+            lookup({ host: input.host, repository: ref.repository }).pipe(
+              Effect.as({ ...ref, additions: 1, deletions: 0 }),
+            ),
+          ),
+        getViewerPermissions: (input) =>
+          lookup(input).pipe(Effect.as(hostedChangeRequest("").viewerPermissions)),
+        comment: (input) => lookup(input).pipe(Effect.asVoid),
+        listReviewerCandidates: (input) =>
+          lookup(input).pipe(Effect.as({ candidates: [], truncated: false })),
+        getReviewThreadComments: (input) =>
+          lookup(input).pipe(Effect.as({ comments: [], nextCursor: null })),
+        setFilesViewed: native.setFilesViewed!,
+      });
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "A",
+            workspaceRoot: "/a",
+            repository: "ownera/repo",
+            remoteUrl: "https://github.com/OwnerA/Repo.git",
+          }),
+        ],
+        providers: [provider],
+      });
+      const ref = { projectId: "p1" as ProjectId, repository: "ownera/repo", number: 1 };
+      const listed = yield* service.list({ state: "open" });
+      assert.deepStrictEqual(
+        listed.entries.map((entry) => entry.repository),
+        ["ownera/repo"],
+      );
+      assert.strictEqual((yield* service.detail(ref)).body, "fake-OwnerA-1");
+      yield* credentials.invalidate("github.com", "ownera/repo");
+      generation = 2;
+      assert.strictEqual((yield* service.detail(ref)).body, "fake-OwnerA-2");
+      assert.strictEqual(
+        (yield* service.listStats({ refs: [ref] })).stats[0]?.repository,
+        "ownera/repo",
+      );
+      yield* service.comment({ ...ref, body: "Fake comment" });
+      yield* service.reviewerCandidates(ref);
+      yield* service.threadComments({ ...ref, threadId: "fake-thread", cursor: "fake-cursor" });
+      assert.ok(lookups.length >= 7);
+      assert.ok(lookups.every((repository) => repository === "OwnerA/Repo"));
+      yield* credentials.invalidate("github.com", "ownera/repo");
+      generation = 3;
+      yield* service.setFilesViewed({ ...ref, files: [{ path: "file.ts", viewed: true }] });
+      assert.ok(
+        requests.some(
+          (request) =>
+            request.operation.includes("markFileAsViewed") &&
+            request.authorization === "Bearer fake-OwnerA-3",
+        ),
+      );
+      const cross = yield* service.detail({
+        ...ref,
+        repository: "ownerb/repo",
+        host: "github.com",
+      });
+      assert.strictEqual(cross.repository, "ownerb/repo");
+      assert.strictEqual(cross.body, "fake-ownerb-3");
+      assert.strictEqual(lookups.at(-1), "ownerb/repo");
+      assert.deepStrictEqual(helperPaths, [
+        "OwnerA/Repo.git",
+        "OwnerA/Repo.git",
+        "OwnerA/Repo.git",
+        "ownerb/repo.git",
+      ]);
+    }).pipe(
+      Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+    ),
+);
+
+it.effect.each([
+  { remoteUrl: "https://github.com/OwnerA/Repo.git", enabled: false },
+  { remoteUrl: "https://evil.example/OwnerA/Repo.git", enabled: true },
+  { remoteUrl: "https://github.com/Other/Repo.git", enabled: true },
+])(
+  "keeps canonical selectors when remote spelling is inapplicable: $remoteUrl, opt-in $enabled",
+  ({ remoteUrl, enabled }) =>
+    Effect.gen(function* () {
+      const asked: string[] = [];
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "A",
+            workspaceRoot: "/a",
+            repository: "ownera/repo",
+            remoteUrl,
+          }),
+        ],
+        providers: [
+          fakeProvider(SourceControlProviderKind.make("github"), {
+            withVerifiedCredential: (input, use) => {
+              asked.push(input.repository!);
+              return use({ accountId: "101", viewer: "Chinoman10", credentialFingerprint: "fake" });
+            },
+            getChangeRequest: (input) => {
+              asked.push(input.repository);
+              return Effect.succeed(hostedChangeRequest("fake body"));
+            },
+          }),
+        ],
+      });
+      yield* service.detail({ projectId: "p1" as ProjectId, repository: "ownera/repo", number: 1 });
+      assert.ok(asked.every((repository) => repository === "ownera/repo"));
+    }).pipe(
+      Effect.provideService(HostProcess.Environment, {
+        T3CODE_GITHUB_USE_GIT_CREDENTIALS: enabled ? "1" : "0",
+      }),
+    ),
+);
+
+it.effect("keeps opted-in repository viewers and list searches separate for one login", () =>
+  Effect.gen(function* () {
+    const listed: string[] = [];
+    let blocked = false;
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "A", workspaceRoot: "/a", repository: "OwnerA/Repo" }),
+        project({ id: "p2", title: "B", workspaceRoot: "/b", repository: "OwnerB/Repo" }),
+      ],
+      providers: [
+        fakeProvider(SourceControlProviderKind.make("github"), {
+          getViewer: () => Effect.die("A repository listing must not use the host-wide viewer"),
+          withVerifiedCredential: (input, use) =>
+            input.repository === "OwnerA/Repo" && blocked
+              ? Effect.fail(requestFailed)
+              : use({
+                  accountId: "101",
+                  viewer: "Chinoman10",
+                  credentialFingerprint: `pat:${input.repository}`,
+                }),
+          listChangeRequestsAcross: () => Effect.die("Cannot mix owner credentials in one search"),
+          listChangeRequests: (input) =>
+            Effect.sync(() => {
+              listed.push(input.repository);
+              assert.strictEqual(input.viewer, "Chinoman10");
+              return {
+                items: [changeRequest(1, "2026-07-02T00:00:00Z")],
+                truncated: false,
+                continues: true,
+              };
+            }),
+        }),
+      ],
+    });
+    assert.strictEqual((yield* service.list({ state: "open" })).entries.length, 2);
+    assert.deepStrictEqual(listed.sort(), ["OwnerA/Repo", "OwnerB/Repo"]);
+    blocked = true;
+    const next = yield* service.list({ state: "open" });
+    assert.deepStrictEqual(
+      next.entries.map((entry) => entry.repository),
+      ["OwnerB/Repo"],
+    );
+    assert.strictEqual(next.errors.length, 1);
+  }).pipe(
+    Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+  ),
+);
+
+it.effect("namespaces ordinary detail caches by repository PAT without a routing RPC", () =>
+  Effect.gen(function* () {
+    for (const operation of ["summary", "detail"] as const) {
+      let credential = "broad";
+      let reads = 0;
+      const read = () =>
+        Effect.suspend(() => {
+          reads++;
+          return credential === "broad"
+            ? Effect.succeed(hostedChangeRequest("private content"))
+            : Effect.fail(requestFailed);
+        });
+      const service = yield* makeService({
+        projects: [
+          project({ id: "p1", title: "A", workspaceRoot: "/a", repository: "OwnerA/Repo" }),
+        ],
+        providers: [
+          fakeProvider(SourceControlProviderKind.make("github"), {
+            withVerifiedCredential: (input, use) => {
+              assert.strictEqual(input.repository, "OwnerA/Repo");
+              return use({
+                accountId: "101",
+                viewer: "Chinoman10",
+                credentialFingerprint: credential,
+              });
+            },
+            getChangeRequest: read,
+            getChangeRequestSummary: read,
+          }),
+        ],
+      });
+      const ref = { projectId: "p1" as ProjectId, repository: "OwnerA/Repo", number: 1 };
+      yield* service[operation](ref);
+      credential = "restricted";
+      for (const allowStale of [false, true])
+        assert.strictEqual(
+          (yield* service[operation]({ ...ref, allowStale }).pipe(Effect.flip))._tag,
+          "PullRequestOperationError",
+        );
+      assert.strictEqual(reads, 3);
+    }
+  }).pipe(
+    Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+  ),
 );
 
 it.effect("routing verifies the current account on the requested host without caching it", () =>
