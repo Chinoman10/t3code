@@ -163,10 +163,9 @@ export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const environment = yield* HostProcess.Environment;
   const workingDirectory = yield* HostProcess.WorkingDirectory;
-  const gitPaths = new Map<string, string>();
-
   const fromGit = Effect.fnUntraced(function* (repository: string) {
     const host = "github.com";
+    const normalized = repository.toLowerCase();
     const invalid = () => new GitHubGitCredentialError({ host, reason: "response" });
     const output = yield* process
       .run({
@@ -176,7 +175,7 @@ export const make = Effect.gen(function* () {
         // Ignore any repository around the server working directory, including inherited Git
         // selectors. Helpers come only from the server's system/global configuration.
         cwd: workingDirectory,
-        stdin: `protocol=https\nhost=github.com\npath=${gitPaths.get(repository) ?? repository}.git\n\n`,
+        stdin: `protocol=https\nhost=github.com\npath=${repository}.git\n\n`,
         env: {
           GIT_DIR: "",
           GIT_WORK_TREE: "",
@@ -215,9 +214,10 @@ export const make = Effect.gen(function* () {
     if (output.exitCode !== 0) {
       // With prompts disabled, Git's specific missing-credential exit is a normal miss. Any
       // helper error before it makes this an operational failure, rather than a fallback.
-      const missing =
-        /^fatal: could not read (?:Username|Password) for '[^'\n]*': terminal prompts disabled\r?\n?$/;
-      if (output.stdout === "" && missing.test(output.stderr)) return null;
+      const missing = output.stderr.match(
+        /^(?:fatal: could not read (?:Username|Password) for '[^'\r\n]*': terminal prompts disabled|fatal: unable to get password from user)(?:\r?\n)?$/,
+      );
+      if (output.stdout === "" && missing?.[0] === output.stderr) return null;
       return yield* new GitHubGitCredentialError({ host, reason: "process" });
     }
     if (output.stderr !== "")
@@ -242,7 +242,7 @@ export const make = Effect.gen(function* () {
     if (
       fields.get("protocol") !== "https" ||
       fields.get("host") !== host ||
-      (path !== undefined && normalizeCredentialRepository(path) !== repository)
+      (path !== undefined && normalizeCredentialRepository(path) !== normalized)
     )
       return yield* invalid();
     const token = fields.get("password");
@@ -250,7 +250,7 @@ export const make = Effect.gen(function* () {
     if (!/^[\x21-\x7e]+$/.test(token)) return yield* invalid();
     return {
       host,
-      repository,
+      repository: normalized,
       source: "git",
       token: Redacted.make(token),
       fingerprint: yield* fingerprintOf(host, token),
@@ -387,12 +387,9 @@ export const make = Effect.gen(function* () {
         host === "github.com" &&
         repository !== undefined
       ) {
-        const normalized = normalizeCredentialRepository(repository);
-        if (normalized === null)
+        if (normalizeCredentialRepository(repository) === null)
           return yield* new GitHubGitCredentialError({ host, reason: "repository" });
-        if (gitPaths.size >= 128) gitPaths.delete(gitPaths.keys().next().value!);
-        gitPaths.set(normalized, repository.replace(/\.git$/i, ""));
-        const credential = yield* Cache.get(gitCache, normalized);
+        const credential = yield* Cache.get(gitCache, repository.replace(/\.git$/i, ""));
         if (credential !== null) return credential;
       }
       // A token saved in Settings is the most deliberate choice, so it comes before the
@@ -417,7 +414,16 @@ export const make = Effect.gen(function* () {
         normalized !== null &&
         environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS === "1"
       )
-        return Cache.invalidate(gitCache, normalized);
+        return Effect.gen(function* () {
+          const keys = Array.from(yield* Cache.keys(gitCache));
+          // Accept canonical helper provenance and selectors carrying a clone .git suffix.
+          const literal = repository?.toLowerCase();
+          yield* Effect.forEach(
+            keys.filter((key) => key.toLowerCase() === literal || key.toLowerCase() === normalized),
+            (key) => Cache.invalidate(gitCache, key),
+            { discard: true },
+          );
+        });
       return hostChoice(host).pipe(
         Effect.flatMap((choice) => Cache.invalidate(cache, cacheKey(host, choice?.account))),
       );

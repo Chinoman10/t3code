@@ -44,6 +44,7 @@ function harness(
   options: {
     enabled?: boolean;
     disabledHost?: boolean;
+    fallback?: "settings" | "env" | "gh";
     cwd?: string;
     run?: SourceControlHost.SourceControlHost["Service"]["process"]["run"];
   } = {},
@@ -67,7 +68,10 @@ function harness(
         settings: applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
           sourceControlHosts: {
             github: {
-              tokens: { "github.com": "settings-token" },
+              tokens:
+                options.fallback === undefined || options.fallback === "settings"
+                  ? { "github.com": "settings-token" }
+                  : {},
               hosts: {
                 "github.com": { enabled: !options.disabledHost },
               },
@@ -80,7 +84,7 @@ function harness(
     Layer.provide(
       Layer.succeed(HostProcess.Environment, {
         T3CODE_GITHUB_USE_GIT_CREDENTIALS: options.enabled === false ? "0" : "1",
-        GH_TOKEN: "env-token",
+        GH_TOKEN: options.fallback === "gh" ? "" : "env-token",
       }),
     ),
     Layer.provide(Layer.succeed(HostProcess.WorkingDirectory, options.cwd ?? "/trusted-server")),
@@ -179,6 +183,10 @@ describe("repository Git credentials", () => {
           );
           expect(Redacted.value((yield* credentials.get("github.com", "OwnerB/Repo")).token)).toBe(
             "fake-OwnerB",
+          );
+          expect((yield* credentials.get("github.com", "ownera/repo")).source).toBe("settings");
+          expect(Redacted.value((yield* credentials.get("github.com", "OwnerA/Repo")).token)).toBe(
+            "fake-OwnerA",
           );
         }).pipe(Effect.provide(layer));
         const authorizations: Array<string | undefined> = [];
@@ -291,7 +299,7 @@ describe("repository Git credentials", () => {
           const paths = calls
             .filter((input) => input.operation === "GitHubCredentials.git")
             .map((input) => /path=(.*)\n/.exec(input.stdin ?? "")?.[1]);
-          expect(paths.slice(2)).toEqual(Array(24).fill("OwnerA/Repo.git"));
+          expect(paths.slice(3)).toEqual(Array(24).fill("OwnerA/Repo.git"));
         }).pipe(
           Effect.provide(transport),
           Effect.provideService(HostProcess.Environment, {
@@ -324,17 +332,25 @@ describe("repository Git credentials", () => {
       expect(first.repository).toBe("ownera/repo");
       expect(Redacted.value(first.token)).toBe("fake-1");
       expect(Redacted.value(second.token)).toBe("fake-2");
-      expect((yield* credentials.get("github.com", "ownera/repo")).fingerprint).toBe(
+      const lowercase = yield* credentials.get("github.com", "ownera/repo");
+      expect(lowercase.fingerprint).not.toBe(first.fingerprint);
+      expect((yield* credentials.get("github.com", "OwnerA/Repo")).fingerprint).toBe(
         first.fingerprint,
       );
-      yield* credentials.invalidate("github.com", "OwnerA/Repo");
-      expect((yield* credentials.get("github.com", "ownera/repo")).fingerprint).not.toBe(
+      expect((yield* credentials.get("github.com", "ownera/repo")).fingerprint).toBe(
+        lowercase.fingerprint,
+      );
+      yield* credentials.invalidate("github.com", "ownera/repo");
+      expect((yield* credentials.get("github.com", "OwnerA/Repo")).fingerprint).not.toBe(
         first.fingerprint,
+      );
+      expect((yield* credentials.get("github.com", "ownera/repo")).fingerprint).not.toBe(
+        lowercase.fingerprint,
       );
       expect((yield* credentials.get("github.com", "OwnerB/Repo")).fingerprint).toBe(
         second.fingerprint,
       );
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(5);
       expect(calls[0]?.stdin).toBe("protocol=https\nhost=github.com\npath=OwnerA/Repo.git\n\n");
       expect(calls[0]?.cwd).toBe("/trusted-server");
       expect(calls[0]?.env).toMatchObject({
@@ -362,6 +378,198 @@ describe("repository Git credentials", () => {
       );
       yield* credentials.get("enterprise.example", "owner/repo");
       expect(calls.every((input) => input.command !== "git")).toBe(true);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("preserves each selector's spelling through repeated cache expiry", () => {
+    let generation = 1;
+    const { layer, calls } = harness({
+      run: (input) => {
+        const path = /path=(.*)\n/.exec(input.stdin ?? "")?.[1] ?? "";
+        return Effect.succeed(output(response(path, `fake-${path}-${generation}`)));
+      },
+    });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      for (; generation <= 3; generation++) {
+        for (const selector of ["OwnerA/Repo", "ownera/repo"]) {
+          const credential = yield* credentials.get("github.com", selector);
+          expect(credential.repository).toBe("ownera/repo");
+          expect(Redacted.value(credential.token)).toBe(`fake-${selector}.git-${generation}`);
+          expect((yield* credentials.get("github.com", `${selector}.git`)).fingerprint).toBe(
+            credential.fingerprint,
+          );
+        }
+        yield* TestClock.adjust("5 minutes");
+      }
+      expect(calls.map((input) => /path=(.*)\n/.exec(input.stdin ?? "")?.[1])).toEqual(
+        Array.from({ length: 3 }, () => ["OwnerA/Repo.git", "ownera/repo.git"]).flat(),
+      );
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("strips one transport suffix while preserving a repository's .git ending", () => {
+    const { layer, calls } = harness();
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const credential = yield* credentials.get("github.com", "Owner/Repo.git.git");
+      const unrelated = yield* credentials.get("github.com", "OwnerB/Repo");
+      expect(credential.repository).toBe("owner/repo.git");
+      expect(calls[0]?.stdin).toBe("protocol=https\nhost=github.com\npath=Owner/Repo.git.git\n\n");
+      expect((yield* credentials.get("github.com", "Owner/Repo.git.git")).fingerprint).toBe(
+        credential.fingerprint,
+      );
+      yield* credentials.invalidate("github.com", credential.repository);
+      const refreshed = yield* credentials.get("github.com", "Owner/Repo.git.git");
+      expect(refreshed.fingerprint).not.toBe(credential.fingerprint);
+      yield* credentials.invalidate("github.com", "Owner/Repo.git.git");
+      expect((yield* credentials.get("github.com", "Owner/Repo.git.git")).fingerprint).not.toBe(
+        refreshed.fingerprint,
+      );
+      const ordinary = yield* credentials.get("github.com", "Owner/Repo");
+      yield* credentials.invalidate("github.com", "Owner/Repo.git");
+      expect((yield* credentials.get("github.com", "Owner/Repo")).fingerprint).not.toBe(
+        ordinary.fingerprint,
+      );
+      expect((yield* credentials.get("github.com", "OwnerB/Repo")).fingerprint).toBe(
+        unrelated.fingerprint,
+      );
+      expect(calls).toHaveLength(6);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("invalidates pending spelling variants without reviving their completed entries", () =>
+    Effect.gen(function* () {
+      const startedUpper = yield* Deferred.make<void>();
+      const startedLower = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let pending = true;
+      const { layer, calls } = harness({
+        run: (input) =>
+          Effect.gen(function* () {
+            const path = /path=(.*)\n/.exec(input.stdin ?? "")?.[1] ?? "";
+            const hold = pending && path.toLowerCase() === "ownera/repo.git";
+            if (hold) {
+              // Cache.get installs its pending entry after launching the lookup fiber.
+              yield* Effect.yieldNow;
+              yield* Deferred.succeed(
+                path.startsWith("OwnerA/") ? startedUpper : startedLower,
+                undefined,
+              );
+              yield* Deferred.await(release);
+            }
+            return output(response(path, hold ? "fake-before" : "fake-after"));
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const credentials = yield* GitHubCredentials.GitHubCredentials;
+        const unrelated = yield* credentials.get("github.com", "OwnerB/Repo");
+        const waiting = yield* Effect.all(
+          ["OwnerA/Repo", "ownera/repo"].map((repository) =>
+            credentials.get("github.com", repository),
+          ),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(startedUpper);
+        yield* Deferred.await(startedLower);
+        yield* credentials.invalidate("github.com", "ownera/repo");
+        pending = false;
+        yield* Deferred.succeed(release, undefined);
+        expect(
+          (yield* Fiber.join(waiting)).map((credential) => Redacted.value(credential.token)),
+        ).toEqual(["fake-before", "fake-before"]);
+        for (const repository of ["OwnerA/Repo", "ownera/repo"])
+          expect(Redacted.value((yield* credentials.get("github.com", repository)).token)).toBe(
+            "fake-after",
+          );
+        expect((yield* credentials.get("github.com", "OwnerB/Repo")).fingerprint).toBe(
+          unrelated.fingerprint,
+        );
+        expect(calls).toHaveLength(5);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect.each([401, 403])(
+    "evicts all spelling variants after canonical HTTP %s refusal",
+    (status) => {
+      let generation = 1;
+      let requests = 0;
+      const { layer, calls } = harness({
+        run: (input) => {
+          const path = /path=(.*)\n/.exec(input.stdin ?? "")?.[1] ?? "";
+          return Effect.succeed(output(response(path, `fake-${path}-${generation}`)));
+        },
+      });
+      const http = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) => {
+          requests++;
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, new Response(null, { status })),
+          );
+        }),
+      );
+      const transport = GitHubRest.layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(layer, http, GitHubQuota.layer, SourceControlRateLimit.layer),
+        ),
+      );
+      return Effect.gen(function* () {
+        const credentials = yield* GitHubCredentials.GitHubCredentials;
+        const api = yield* GitHubRest.GitHubRest;
+        for (const repository of ["OwnerA/Repo", "ownera/repo", "OwnerB/Repo"])
+          yield* credentials.get("github.com", repository);
+        const error = yield* api
+          .rest({
+            host: "github.com",
+            repository: "OwnerA/Repo",
+            operation: "test",
+            path: "repos/OwnerA/Repo",
+          })
+          .pipe(Effect.flip);
+        expect(error._tag).toBe(
+          status === 401 ? "GitHubApiAuthenticationError" : "GitHubApiResponseError",
+        );
+        generation++;
+        for (const repository of ["OwnerA/Repo", "ownera/repo"])
+          expect(Redacted.value((yield* credentials.get("github.com", repository)).token)).toBe(
+            `fake-${repository}.git-2`,
+          );
+        expect(Redacted.value((yield* credentials.get("github.com", "OwnerB/Repo")).token)).toBe(
+          "fake-OwnerB/Repo.git-1",
+        );
+        expect(calls).toHaveLength(5);
+        expect(requests).toBe(1);
+      }).pipe(
+        Effect.provide(transport),
+        Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+      );
+    },
+  );
+
+  it.effect("does not let a lowercase helper miss poison the original selector", () => {
+    const { layer, calls } = harness({
+      run: (input) =>
+        Effect.succeed(
+          input.stdin?.includes("path=OwnerA/Repo.git\n")
+            ? output(response("ownera/repo.git", "fake-owner-a"))
+            : output("", {
+                exitCode: ChildProcessSpawner.ExitCode(128),
+                stderr: "fatal: unable to get password from user\n",
+              }),
+        ),
+    });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      for (let round = 0; round < 3; round++) {
+        expect((yield* credentials.get("github.com", "ownera/repo")).source).toBe("settings");
+        expect(Redacted.value((yield* credentials.get("github.com", "OwnerA/Repo")).token)).toBe(
+          "fake-owner-a",
+        );
+        yield* TestClock.adjust("10 seconds");
+      }
+      expect(calls).toHaveLength(4);
     }).pipe(Effect.provide(layer));
   });
 
@@ -399,6 +607,111 @@ describe("repository Git credentials", () => {
     return Effect.gen(function* () {
       const credentials = yield* GitHubCredentials.GitHubCredentials;
       expect((yield* credentials.get("github.com", "owner/repo")).source).toBe("settings");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect.each(
+    [
+      "fatal: unable to get password from user",
+      "fatal: could not read Username for 'https://github.com/OwnerA/Repo.git': terminal prompts disabled",
+      "fatal: could not read Password for 'https://github.com/OwnerA/Repo.git': terminal prompts disabled",
+    ].flatMap((message) =>
+      ["", "\n", "\r\n"].flatMap((ending) =>
+        (["settings", "env", "gh"] as const).map((fallback) => ({ message, ending, fallback })),
+      ),
+    ),
+  )(
+    "accepts only an exact normal miss with $fallback fallback: $message, ending $ending",
+    ({ message, ending, fallback }) => {
+      const { layer, calls } = harness({
+        fallback,
+        run: (input) =>
+          Effect.succeed(
+            input.command === "gh"
+              ? output("fake-gh\n")
+              : output("", {
+                  exitCode: ChildProcessSpawner.ExitCode(128),
+                  stderr: message + ending,
+                }),
+          ),
+      });
+      return Effect.gen(function* () {
+        const credentials = yield* GitHubCredentials.GitHubCredentials;
+        const credential = yield* credentials.get("github.com", "OwnerA/Repo");
+        expect(credential.source).toBe(fallback);
+        expect(Redacted.value(credential.token)).toBe(
+          fallback === "settings" ? "settings-token" : fallback === "env" ? "env-token" : "fake-gh",
+        );
+        yield* credentials.get("github.com", "OwnerA/Repo");
+        expect(calls.filter((input) => input.command === "git")).toHaveLength(1);
+        expect(calls.filter((input) => input.command === "gh")).toHaveLength(
+          fallback === "gh" ? 1 : 0,
+        );
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
+  it.effect.each([
+    {
+      name: "prefixed helper diagnostic",
+      stderr: "fake-secret helper failed\nfatal: unable to get password from user\n",
+    },
+    {
+      name: "suffixed helper diagnostic",
+      stderr: "fatal: unable to get password from user\nfake-secret helper failed\n",
+    },
+    { name: "extra LF", stderr: "fatal: unable to get password from user\n\n" },
+    { name: "extra CRLF", stderr: "fatal: unable to get password from user\r\n\r\n" },
+    { name: "bare CR", stderr: "fatal: unable to get password from user\r" },
+    { name: "trailing space", stderr: "fatal: unable to get password from user \n" },
+    { name: "partial fatal", stderr: "fatal: unable to get password from us" },
+    {
+      name: "old fatal with extra LF",
+      stderr:
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n\n",
+    },
+    {
+      name: "old fatal with helper diagnostic",
+      stderr:
+        "fake-secret\nfatal: could not read Username for 'https://github.com': terminal prompts disabled\n",
+    },
+    {
+      name: "partial stdout",
+      stdout: "protocol=https\nhost=github.com\n",
+      stderr: "fatal: unable to get password from user\n",
+    },
+    {
+      name: "credential stdout",
+      stdout: response("OwnerA/Repo.git", "fake-secret"),
+      stderr: "fatal: unable to get password from user\n",
+    },
+    {
+      name: "zero exit",
+      exitCode: ChildProcessSpawner.ExitCode(0),
+      stderr: "fatal: unable to get password from user\n",
+    },
+    {
+      name: "truncated stderr",
+      stderrTruncated: true,
+      stderr: "fatal: unable to get password from user\n",
+    },
+    {
+      name: "invalid UTF-8",
+      stderrInvalidUtf8: true,
+      stderr: "fatal: unable to get password from user\n",
+    },
+  ])("does not fall back on a malformed missing-credential result: $name", (answer) => {
+    const { layer, calls } = harness({
+      run: () =>
+        Effect.succeed(output("", { exitCode: ChildProcessSpawner.ExitCode(128), ...answer })),
+    });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const error = yield* credentials.get("github.com", "OwnerA/Repo").pipe(Effect.flip);
+      expect(error._tag).toBe("GitHubGitCredentialError");
+      expect(JSON.stringify(error)).not.toContain("fake-secret");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.command).toBe("git");
     }).pipe(Effect.provide(layer));
   });
 
