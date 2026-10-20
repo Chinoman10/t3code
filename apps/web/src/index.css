@@ -2118,7 +2118,7 @@ code {
 .chat-markdown th,
 .chat-markdown td {
   padding: 0.45rem 0.75rem;
-  text-align: left;
+  text-align: center;
 }
 
 .chat-markdown thead th {
@@ -2145,6 +2145,22 @@ code {
 .chat-markdown .chat-markdown-table-container[data-expanded="true"] td {
   max-width: 24rem;
   overflow-wrap: anywhere;
+}
+
+/* Fit expanded tables to wide timeline lanes; narrow lanes keep horizontal
+   scrolling so prose columns remain readable. */
+@container chat-lane (min-width: 36rem) {
+  .chat-markdown .chat-markdown-table-container[data-expanded="true"] table {
+    min-width: 0;
+  }
+
+  .chat-markdown .chat-markdown-table-container[data-expanded="true"] th {
+    white-space: normal;
+  }
+
+  .chat-markdown .chat-markdown-table-container[data-expanded="true"] td {
+    overflow-wrap: break-word;
+  }
 }
 
 /* Formula cells keep their natural width and scroll with the table. */
