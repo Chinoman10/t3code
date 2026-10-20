@@ -177,10 +177,17 @@ describe("isAutoSettlementCandidate", () => {
     ).toBe(true);
     expect(
       ThreadSettlementService.isAutoSettlementCandidate(
-        shell({ ...snoozed, latestRunCompletedAt: at(-30 * 60 * 1_000) }),
+        shell({ ...snoozed, status: "completed", latestRunCompletedAt: at(-30 * 60 * 1_000) }),
         NOW_MS,
       ),
     ).toBe(true);
+    // An interrupted run leaves the thread snoozed, as the sidebar shows it.
+    expect(
+      ThreadSettlementService.isAutoSettlementCandidate(
+        shell({ ...snoozed, status: "interrupted", latestRunCompletedAt: at(-30 * 60 * 1_000) }),
+        NOW_MS,
+      ),
+    ).toBe(false);
     expect(
       ThreadSettlementService.isAutoSettlementCandidate(
         shell({ ...snoozed, status: "failed", latestRunCompletedAt: at(-2 * 60 * 60 * 1_000) }),
@@ -297,8 +304,28 @@ describe("resolveAutoSettlementAt", () => {
     expect(
       ThreadSettlementService.resolveAutoSettlementAt({ ...input, autoSettleAfterDays: null }),
     ).toBeNull();
+  });
+
+  it("anchors an empty thread's inactivity at its creation time", () => {
+    const input = {
+      thread: shell({ createdAt: at(-3 * DAY_MS) }),
+      pullRequest: null,
+      nowMs: NOW_MS,
+      autoSettleAfterDays: 2,
+      autoSettleOnMerge: false,
+    };
+    expect(ThreadSettlementService.resolveAutoSettlementAt(input)).toEqual(at(-3 * DAY_MS));
     expect(
-      ThreadSettlementService.resolveAutoSettlementAt({ ...input, thread: shell() }),
+      ThreadSettlementService.resolveAutoSettlementAt({
+        ...input,
+        thread: shell({ createdAt: at(-DAY_MS) }),
+      }),
+    ).toBeNull();
+    expect(
+      ThreadSettlementService.resolveAutoSettlementAt({
+        ...input,
+        thread: { ...input.thread, lastSnoozeWakeAt: at(-DAY_MS) },
+      }),
     ).toBeNull();
   });
 
@@ -378,6 +405,53 @@ describe("resolveAutoSettlementAt", () => {
         thread: { ...woken, latestUserAuthoredMessageAt: at(-30 * 60 * 1_000) },
       }),
     ).toBeNull();
+  });
+
+  it("does not settle on pull requests that were already merged when linked", () => {
+    const link = (number: number, linkedAt: DateTime.Utc, mergedAt: DateTime.Utc) => ({
+      host: "example.test",
+      repository: "owner/repository",
+      number,
+      url: `https://example.test/owner/repository/pull/${number}`,
+      source: "agent" as const,
+      linkedAt: DateTime.formatIso(linkedAt),
+      snapshot: {
+        state: "merged" as const,
+        title: "Pull request",
+        headBranch: `feature-${number}`,
+        baseBranch: "main",
+        isDraft: false,
+        updatedAt: DateTime.formatIso(mergedAt),
+        syncedAt: DateTime.formatIso(linkedAt),
+        mergedAt: DateTime.formatIso(mergedAt),
+      },
+      stack: null,
+    });
+    // The user asked the agent to merge pull requests; it merged one, then
+    // linked it to the thread as a record of the work.
+    const recorded = link(1, at(-50 * 60 * 1_000), at(-55 * 60 * 1_000));
+    const input = {
+      thread: shell({
+        latestUserMessageAt: at(-2 * 60 * 60 * 1_000),
+        latestRunCompletedAt: at(-45 * 60 * 1_000),
+        pullRequests: [recorded],
+      }),
+      pullRequest: null,
+      nowMs: NOW_MS,
+      autoSettleAfterDays: null,
+      autoSettleOnMerge: true,
+    };
+    expect(ThreadSettlementService.resolveAutoSettlementAt(input)).toBeNull();
+    // A pull request linked while open still settles the thread when it merges.
+    expect(
+      ThreadSettlementService.resolveAutoSettlementAt({
+        ...input,
+        thread: {
+          ...input.thread,
+          pullRequests: [recorded, link(2, at(-90 * 60 * 1_000), at(-40 * 60 * 1_000))],
+        },
+      }),
+    ).toEqual(at(-45 * 60 * 1_000));
   });
 
   it("settles inactive threads even when their pull request remains open", () => {
@@ -847,6 +921,64 @@ describe("ThreadSettlementServiceV2 worker", () => {
           assert.deepStrictEqual(yield* Ref.get(fixture.commands), []);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
           assert.deepStrictEqual(yield* Ref.get(fixture.branchCalls), []);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("does not look up a pull request that was already merged when linked", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const reference = {
+          projectId: PROJECT_ID,
+          repository: "owner/repository",
+          number: 42,
+          url: "https://example.test/owner/repository/pull/42",
+        };
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("merged-then-linked", {
+              linkedPullRequest: reference,
+              pullRequests: [
+                {
+                  host: "example.test",
+                  repository: reference.repository,
+                  number: reference.number,
+                  url: reference.url,
+                  source: "agent",
+                  linkedAt: "2026-08-28T00:00:00.000Z",
+                  snapshot: {
+                    state: "merged",
+                    title: "Pull request",
+                    headBranch: "feature",
+                    baseBranch: "main",
+                    isDraft: false,
+                    updatedAt: "2026-08-27T00:00:00.000Z",
+                    syncedAt: "2026-08-28T00:00:00.000Z",
+                    mergedAt: "2026-08-27T00:00:00.000Z",
+                  },
+                  stack: null,
+                },
+              ],
+            }),
+          ]),
+          settings: {
+            ...DEFAULT_SERVER_SETTINGS,
+            sidebarAutoSettleAfterDays: null,
+            sidebarAutoSettleOnMerge: true,
+          },
+          pullRequestSummary: (input) =>
+            Effect.succeed({
+              ...makePullRequestSummary({ ...input, state: "merged" }),
+              mergedAt: "2026-08-27T00:00:00.000Z",
+            }),
+        });
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+          assert.deepStrictEqual(yield* Ref.get(fixture.commands), []);
+          assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
         }).pipe(Effect.provide(fixture.layer));
       }),
     ),

@@ -60,6 +60,8 @@ import {
 
 const LITELLM_RATES_URL =
   "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+const LITELLM_RATES_API_URL =
+  "https://api.github.com/repos/BerriAI/litellm/contents/model_prices_and_context_window.json?ref=main";
 
 const RATES_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -210,6 +212,7 @@ export const make = Effect.gen(function* () {
     );
   let rates: RateTable = new Map();
   let ratesFetchedAtMs: number | null = null;
+  let ratesLastFailedAtMs: number | null = null;
   let ratesStatus: UsagePricing["status"] = "unavailable";
   const ratesLock = yield* Semaphore.make(1);
 
@@ -220,6 +223,18 @@ export const make = Effect.gen(function* () {
       ratesFetchedAtMs === null ? null : DateTime.formatIso(DateTime.makeUnsafe(ratesFetchedAtMs)),
     knownModels: rates.size,
   });
+
+  const fetchRates = (url: string, accept = "application/json") =>
+    httpClient.get(url, { headers: { accept } }).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.json),
+      Effect.map((document) => {
+        const parsed = parseRateTable(document);
+        return parsed.size > 0 ? { document, parsed } : null;
+      }),
+      Effect.timeout(10_000),
+      Effect.catchCause(() => Effect.succeed(null)),
+    );
 
   const loadRates = Effect.fn("UsageService.loadRates")(function* (force: boolean) {
     const now = yield* Clock.currentTimeMillis;
@@ -242,25 +257,24 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    const fetched = yield* httpClient.get(LITELLM_RATES_URL).pipe(
-      Effect.flatMap(HttpClientResponse.filterStatusOk),
-      Effect.flatMap((response) => response.json),
-      Effect.timeout(10_000),
-      Effect.catchCause(() => Effect.succeed(null)),
-    );
+    if (ratesLastFailedAtMs !== null && now - ratesLastFailedAtMs < RATES_REFRESH_FLOOR_MS) return;
+
+    let fetched = yield* fetchRates(LITELLM_RATES_URL);
     if (fetched === null) {
+      fetched = yield* fetchRates(LITELLM_RATES_API_URL, "application/vnd.github.raw+json");
+    }
+    if (fetched === null) {
+      ratesLastFailedAtMs = yield* Clock.currentTimeMillis;
       if (rates.size > 0) ratesStatus = "cached";
       return;
     }
 
-    const parsed = parseRateTable(fetched);
-    if (parsed.size === 0) return;
-
-    rates = parsed;
+    rates = fetched.parsed;
     ratesFetchedAtMs = now;
+    ratesLastFailedAtMs = null;
     ratesStatus = "fresh";
 
-    yield* encodeRatesCache({ fetchedAtMs: now, document: fetched }).pipe(
+    yield* encodeRatesCache({ fetchedAtMs: now, document: fetched.document }).pipe(
       Effect.flatMap((contents) => writeCacheFile(ratesCachePath, contents)),
       Effect.ignoreCause,
     );
@@ -437,66 +451,63 @@ export const make = Effect.gen(function* () {
    * than completion order: saved records of deleted transcripts aggregate in
    * cache order, where the first copy of a duplicate wins.
    */
-  const readFileRecords = (
+  const readFileRecords = Effect.fn("UsageService.readFileRecords")(function* (
     filePath: string,
     size: number,
     mtimeMs: number,
     provider: UsageProviderKind,
     format: TranscriptUsageFormat<unknown>,
-  ): Effect.Effect<{
+  ): Effect.fn.Return<{
     readonly records: readonly UsageRecord[];
     readonly failed?: true;
     readonly update?: { readonly entry: CachedFile; readonly replaces: CachedFile | undefined };
-  }> =>
-    Effect.gen(function* () {
-      const cached = fileCache.get(filePath);
-      // Provider is part of the identity: if both providers were ever pointed
-      // at one directory, a hit parsed by the other parser must not be reused.
-      if (
-        cached &&
-        cached.size === size &&
-        cached.mtimeMs === mtimeMs &&
-        cached.provider === provider
-      ) {
-        return {
-          records:
-            cached.tailRecords.length === 0
-              ? cached.records
-              : [...cached.records, ...cached.tailRecords],
-        };
-      }
-
-      // Only a strictly grown file may resume. Same size with a new mtime, or
-      // a shrunken file, means rewritten content; re-parse it whole.
-      const resumeFrom =
-        cached !== undefined && cached.provider === provider && size > cached.size
-          ? cached.position
-          : undefined;
-
-      const parsed = yield* Effect.promise(() =>
-        readTranscriptRecords(filePath, format, resumeFrom),
-      );
-      // A read failure is not an empty transcript: caching it under this
-      // (size, mtime) would silently drop the file's usage until it changes.
-      if (parsed === null)
-        return {
-          records: cached?.provider === provider ? [...cached.records, ...cached.tailRecords] : [],
-          failed: true,
-        };
-
-      const base = parsed.resumed && cached !== undefined ? cached.records : [];
-      const seen = new Set<string>();
-      const records = dedupeWithinFile([...base, ...parsed.records], seen);
-      const tailRecords = dedupeWithinFile(parsed.tailRecords, seen);
-
+  }> {
+    const cached = fileCache.get(filePath);
+    // Provider is part of the identity: if both providers were ever pointed
+    // at one directory, a hit parsed by the other parser must not be reused.
+    if (
+      cached &&
+      cached.size === size &&
+      cached.mtimeMs === mtimeMs &&
+      cached.provider === provider
+    ) {
       return {
-        records: tailRecords.length === 0 ? records : [...records, ...tailRecords],
-        update: {
-          entry: { size, mtimeMs, provider, records, tailRecords, position: parsed.position },
-          replaces: cached,
-        },
+        records:
+          cached.tailRecords.length === 0
+            ? cached.records
+            : [...cached.records, ...cached.tailRecords],
       };
-    });
+    }
+
+    // Only a strictly grown file may resume. Same size with a new mtime, or
+    // a shrunken file, means rewritten content; re-parse it whole.
+    const resumeFrom =
+      cached !== undefined && cached.provider === provider && size > cached.size
+        ? cached.position
+        : undefined;
+
+    const parsed = yield* Effect.promise(() => readTranscriptRecords(filePath, format, resumeFrom));
+    // A read failure is not an empty transcript: caching it under this
+    // (size, mtime) would silently drop the file's usage until it changes.
+    if (parsed === null)
+      return {
+        records: cached?.provider === provider ? [...cached.records, ...cached.tailRecords] : [],
+        failed: true,
+      };
+
+    const base = parsed.resumed && cached !== undefined ? cached.records : [];
+    const seen = new Set<string>();
+    const records = dedupeWithinFile([...base, ...parsed.records], seen);
+    const tailRecords = dedupeWithinFile(parsed.tailRecords, seen);
+
+    return {
+      records: tailRecords.length === 0 ? records : [...records, ...tailRecords],
+      update: {
+        entry: { size, mtimeMs, provider, records, tailRecords, position: parsed.position },
+        replaces: cached,
+      },
+    };
+  });
 
   interface ScannedDir {
     readonly provider: UsageProviderKind;

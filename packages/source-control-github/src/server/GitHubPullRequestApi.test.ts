@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Redacted from "effect/Redacted";
 import { SourceControlProviderKind } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import { HttpClient, HttpClientResponse } from "effect/http";
 
@@ -704,6 +705,139 @@ it.effect(
     }),
 );
 
+it.effect.each([401, 403])(
+  "isolates same-login stack PATs and 304 bodies, preserving invalidation provenance on %i",
+  (status) =>
+    Effect.gen(function* () {
+      const host = "github.com";
+      const repositoryA = "Owner-A/Repo";
+      const repositoryB = "Owner-B/Repo";
+      const fallbackRepository = "Owner-C/Repo";
+      const tokens = new Map([
+        [repositoryA, "pat-a"],
+        [repositoryB, "pat-b"],
+      ]);
+      const requests: Array<{ url: string; token: string; etag: string | undefined }> = [];
+      const invalidations: Array<[string, string | undefined]> = [];
+      const denied = new Set<string>();
+      const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+        get: (hostname, repository) =>
+          Effect.sync(() => {
+            const token = tokens.get(repository ?? "") ?? "host-token";
+            return {
+              host: hostname,
+              token: Redacted.make(token),
+              fingerprint: "pat:" + token,
+              source: token === "host-token" ? ("gh" as const) : ("git" as const),
+              ...(token === "host-token" ? {} : { repository: repository! }),
+            };
+          }),
+        invalidate: (hostname, repository) =>
+          Effect.sync(() => {
+            invalidations.push([hostname, repository]);
+          }),
+      });
+      const http = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.sync(() => {
+            const token = request.headers.authorization!.slice("Bearer ".length);
+            const etag = request.headers["if-none-match"];
+            requests.push({ url: request.url, token, etag });
+            const validator = 'W/"' + token + '"';
+            const number = token === "pat-a" ? 1 : token === "pat-b" ? 2 : 3;
+            const responseStatus = denied.has(token) ? status : etag === validator ? 304 : 200;
+            const body = request.url.endsWith("/user")
+              ? { id: 123, login: "same-account" }
+              : [
+                  {
+                    number,
+                    url: "https://api.github.com/repos/" + repositoryA + "/stacks/" + number,
+                    base: { ref: "main" },
+                    pull_requests: [
+                      { number: 7, head: { ref: "feat/" + token }, state: "open", merged_at: null },
+                    ],
+                  },
+                ];
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(responseStatus === 304 ? null : encodeJson(body), {
+                status: responseStatus,
+                headers: { "content-type": "application/json", etag: validator },
+              }),
+            );
+          }),
+        ),
+      );
+      const cli = yield* GitHubPullRequestApi.make.pipe(
+        Effect.provide(
+          GitHubRest.layer.pipe(
+            Layer.provideMerge(Layer.mergeAll(credentials, http)),
+            Layer.provideMerge(GitHubQuota.layer),
+            Layer.provideMerge(SourceControlRateLimit.layer),
+            Layer.merge(TestSourceControlHost.layer()),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+        Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+      );
+      const input = { cwd: "/repo", host, number: 7 };
+      const identityA = yield* cli.withVerifiedCredential(
+        { ...input, repository: repositoryA },
+        Effect.succeed,
+      );
+      const identityB = yield* cli.withVerifiedCredential(
+        { ...input, repository: repositoryB },
+        Effect.succeed,
+      );
+      expect(identityA.accountId).toBe(identityB.accountId);
+      expect(identityA.credentialFingerprint).not.toBe(identityB.credentialFingerprint);
+      const firstA = yield* cli.getPullRequestStack({ ...input, repository: repositoryA });
+      const firstB = yield* cli.getPullRequestStack({ ...input, repository: repositoryB });
+      expect(firstA?.number).toBe(1);
+      expect(firstB?.number).toBe(2);
+      expect(yield* cli.getPullRequestStack({ ...input, repository: repositoryA })).toEqual(firstA);
+      expect(yield* cli.getPullRequestStack({ ...input, repository: repositoryB })).toEqual(firstB);
+      expect(requests.slice(2).map(({ token, etag }) => [token, etag])).toEqual([
+        ["pat-a", undefined],
+        ["pat-b", undefined],
+        ["pat-a", 'W/"pat-a"'],
+        ["pat-b", 'W/"pat-b"'],
+      ]);
+      // A replacement PAT for the same login and exact path must not reuse the previous body.
+      tokens.set(repositoryA, "pat-a2");
+      expect((yield* cli.getPullRequestStack({ ...input, repository: repositoryA }))?.number).toBe(
+        3,
+      );
+      expect(requests.at(-1)).toMatchObject({ token: "pat-a2", etag: undefined });
+      denied.add("pat-a2");
+      const beforeDenial = requests.length;
+      const refused = yield* Effect.flip(
+        cli.getPullRequestStack({ ...input, repository: repositoryA }),
+      );
+      expect(refused._tag).toBe(
+        status === 401 ? "GitHubApiAuthenticationError" : "GitHubApiResponseError",
+      );
+      expect(requests).toHaveLength(beforeDenial + 1);
+      expect(invalidations).toEqual([[host, repositoryA]]);
+      expect(yield* cli.getPullRequestStack({ ...input, repository: repositoryB })).toEqual(firstB);
+      expect(requests.at(-1)).toMatchObject({ token: "pat-b", etag: 'W/"pat-b"' });
+      // A scoped operation may use the host fallback; invalidation still belongs to that source.
+      denied.add("host-token");
+      const fallback = yield* Effect.flip(
+        cli.getPullRequestStack({ ...input, repository: fallbackRepository }),
+      );
+      expect(fallback._tag).toBe(
+        status === 401 ? "GitHubApiAuthenticationError" : "GitHubApiResponseError",
+      );
+      expect(invalidations).toEqual([
+        [host, repositoryA],
+        [host, undefined],
+      ]);
+      expect(requests.at(-1)).toMatchObject({ token: "host-token", etag: undefined });
+    }),
+);
+
 it.effect.each([
   { expired: false, allowPaused: false },
   { expired: true, allowPaused: false },
@@ -1218,6 +1352,46 @@ layer("GitHubPullRequestApi.layer", (it) => {
         host: "ghe.example.com",
         path: "repos/acme/web/stacks?pull_request=7",
       });
+    }),
+  );
+
+  it.effect("revalidates a polled stack, per credential, so an unchanged one costs no quota", () =>
+    Effect.gen(function* () {
+      const listing = encodeJson([
+        {
+          number: 4,
+          url: "https://api.github.com/repos/acme/poll/stacks/4",
+          base: { ref: "main" },
+          pull_requests: [
+            { number: 9, head: { ref: "feat/nine" }, state: "open", merged_at: null },
+          ],
+        },
+      ]);
+      const read = Effect.flatMap(GitHubPullRequestApi.GitHubPullRequestApi, (cli) =>
+        cli.getPullRequestStack({
+          cwd: "/w",
+          repository: "acme/poll",
+          host: "github.com",
+          number: 9,
+        }),
+      );
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(output(listing, false, false, { etag: 'W/"v1"' })),
+      );
+      const first = yield* read;
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("", false, false, {}, 304)));
+      const second = yield* read;
+      mockedCredential.mockImplementationOnce(() =>
+        Effect.succeed({ token: Redacted.make("other"), fingerprint: "github.com:other" }),
+      );
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output(listing)));
+      yield* read;
+
+      assert.deepStrictEqual(second, first);
+      expect(callAt(0)).not.toHaveProperty("ifNoneMatch");
+      expect(callAt(1)).toMatchObject({ ifNoneMatch: 'W/"v1"' });
+      // Another account never revalidates the first account's answer.
+      expect(callAt(2)).not.toHaveProperty("ifNoneMatch");
     }),
   );
 

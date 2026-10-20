@@ -218,23 +218,26 @@ export const make = Effect.gen(function* () {
       lives.set(lifeKey(target), { ...life, wakes: life.wakes + 1 });
     });
 
-  const reportEnd = (key: string, life: WatchLife, reason: WatchEndReason) =>
-    Effect.gen(function* () {
-      lives.delete(key);
-      const now = yield* Clock.currentTimeMillis;
-      const quietMs = now - life.pushedAt;
-      yield* Effect.logInfo("pull request watch ended", {
-        threadId: life.threadId,
-        pullRequest: life.pullRequest,
-        reason,
-        minutes: minutes(now - life.startedAt),
-        quietMinutes: minutes(quietMs),
-        longestQuietMinutes: minutes(Math.max(life.longestQuietMs, quietMs)),
-        wakes: life.wakes,
-        reads: life.reads,
-        partial: life.startedAt < bootedAt,
-      });
+  const reportEnd = Effect.fn("PullRequestWatchReactor.reportEnd")(function* (
+    key: string,
+    life: WatchLife,
+    reason: WatchEndReason,
+  ) {
+    lives.delete(key);
+    const now = yield* Clock.currentTimeMillis;
+    const quietMs = now - life.pushedAt;
+    yield* Effect.logInfo("pull request watch ended", {
+      threadId: life.threadId,
+      pullRequest: life.pullRequest,
+      reason,
+      minutes: minutes(now - life.startedAt),
+      quietMinutes: minutes(quietMs),
+      longestQuietMinutes: minutes(Math.max(life.longestQuietMs, quietMs)),
+      wakes: life.wakes,
+      reads: life.reads,
+      partial: life.startedAt < bootedAt,
     });
+  });
   const ended = (target: WatchTarget, reason: WatchEndReason) =>
     Effect.suspend(() => reportEnd(lifeKey(target), lifeOf(target), reason));
 
@@ -255,25 +258,26 @@ export const make = Effect.gen(function* () {
    * The orchestrator applies this only while the same watch is on, so a stop or restart
    * that lands during the host read wins.
    */
-  const record = (
+  const record = Effect.fn("PullRequestWatchReactor.record")(function* (
     target: WatchTarget,
     next: ThreadPullRequestWatch | null,
     wake?: { readonly text: string; readonly notification: OrchestrationV2Notification },
-  ) =>
-    Effect.gen(function* () {
-      const uuid = yield* crypto.randomUUIDv4();
-      yield* engine.dispatch({
-        type: "thread.pull-request-watch.sync",
-        commandId: CommandId.make(`server:pr-watch:${target.thread.id}:${uuid}`),
-        threadId: target.thread.id,
-        ...identityOf(target.link),
-        startedAt: target.watch.startedAt,
-        watch: next,
-        ...(wake === undefined
-          ? {}
-          : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
-      });
+    endedWatch?: ThreadPullRequestWatch,
+  ) {
+    const uuid = yield* crypto.randomUUIDv4();
+    yield* engine.dispatch({
+      type: "thread.pull-request-watch.sync",
+      commandId: CommandId.make(`server:pr-watch:${target.thread.id}:${uuid}`),
+      threadId: target.thread.id,
+      ...identityOf(target.link),
+      startedAt: target.watch.startedAt,
+      watch: next,
+      ...(endedWatch === undefined ? {} : { endedWatch }),
+      ...(wake === undefined
+        ? {}
+        : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
     });
+  });
 
   const giveUp = (target: WatchTarget) =>
     record(target, null, {
@@ -477,16 +481,18 @@ export const make = Effect.gen(function* () {
     yield* eachTarget(group, (target) => {
       const report = evaluatePullRequestWatch(target.watch, detail, remarks);
       if (report.changes.length > 0) {
-        return record(
-          target,
-          report.exhausted ? null : report.next,
-          pullRequestWatchMessage({
-            number: target.link.number,
-            url: target.link.url,
-            baseBranch: detail.baseBranch,
-            headSha: report.next.headSha,
-            report,
-          }),
+        const wake = pullRequestWatchMessage({
+          number: target.link.number,
+          url: target.link.url,
+          baseBranch: detail.baseBranch,
+          headSha: report.next.headSha,
+          report,
+        });
+        // An ending watch keeps what this pass saw, so watching again starts from it.
+        return (
+          report.exhausted
+            ? record(target, null, wake, report.next)
+            : record(target, report.next, wake)
         ).pipe(
           Effect.tap(() => woke(target)),
           Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),

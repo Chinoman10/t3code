@@ -57,6 +57,9 @@ const DROPPED_REQUEST_HEADERS = new Set([
   "dpop",
   "content-length",
   "accept-encoding",
+  // Describes the client's HTTPS hop to T3. The hub builds its own origin from it and then
+  // rejects the loopback Origin set below, so every mutation fails over T3 Connect.
+  "x-forwarded-proto",
 ]);
 
 const isWebSocketUpgrade = (request: HttpServerRequest.HttpServerRequest) =>
@@ -96,8 +99,9 @@ const proxyWebSocket = Effect.fn("DeviceHubProxy.proxyWebSocket")(function* (
   return HttpServerResponse.empty();
 });
 
-const pumpFrames = (source: Socket.Socket, sink: Socket.Writer) =>
-  Effect.gen(function* () {
+const pumpFrames =
+  /* Frame pumping runs continuously; a span per frame stream adds no diagnostic value. */
+  Effect.fnUntraced(function* (source: Socket.Socket, sink: Socket.Writer) {
     const { pull } = yield* source.reader;
     while (true) {
       yield* sink.writeAll(yield* pull);

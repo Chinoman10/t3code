@@ -553,7 +553,11 @@ const resolveEditorLaunch = Effect.fn("resolveEditorLaunch")(function* (
     args:
       command === "explorer.exe" && env.WSL_DISTRO_NAME !== undefined
         ? [resolveWslFileManagerPath(input.cwd, env.WSL_DISTRO_NAME)]
-        : [input.cwd],
+        : platform === "win32"
+          ? // Explorer reads `/` as a switch, so `C:/repo` silently opens
+            // a default folder instead of the target.
+            [normalizeWindowsFileManagerPath(input.cwd)]
+          : [input.cwd],
   };
 });
 
@@ -648,10 +652,67 @@ const resolveFileManagerRevealLaunch = Effect.fn("resolveFileManagerRevealLaunch
     };
   }
 
-  // Linux file managers have no portable "select this file" flag, so open
-  // the containing directory instead.
   const path = yield* Path.Path;
   return { editor: "file-manager", target, command, args: [path.dirname(target)] };
+});
+
+const tryRevealLinuxItem = Effect.fn("externalLauncher.tryRevealLinuxItem")(
+  function* (target: string) {
+    const env = yield* readCommandLookupEnv;
+    if (!(yield* isCommandAvailable("gdbus", { env }))) return false;
+
+    const path = yield* Path.Path;
+    const uri = yield* path.toFileUrl(target);
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const exitCode = yield* spawner.exitCode(
+      ChildProcess.make(
+        "gdbus",
+        [
+          "call",
+          "--session",
+          "--dest",
+          "org.freedesktop.FileManager1",
+          "--object-path",
+          "/org/freedesktop/FileManager1",
+          "--method",
+          "org.freedesktop.FileManager1.ShowItems",
+          // File URLs percent-encode the double quotes and backslashes GVariant would interpret.
+          `["${uri.href}"]`,
+          "",
+        ],
+        {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          // Timeout waits for scoped cleanup, even if the helper ignores SIGTERM.
+          forceKillAfter: "1 second",
+        },
+      ),
+    );
+    return exitCode === 0;
+  },
+  Effect.timeout("2 seconds"),
+  Effect.catchTags({
+    BadArgument: () => Effect.succeed(false),
+    PlatformError: () => Effect.succeed(false),
+    TimeoutError: () => Effect.succeed(false),
+  }),
+);
+
+const launchEditor = Effect.fn("externalLauncher.launchEditor")(function* (
+  input: LaunchEditorInput,
+) {
+  const launch = yield* resolveEditorLaunch(input);
+  if (
+    input.editor === "file-manager" &&
+    input.reveal === true &&
+    launch.command === "xdg-open" &&
+    (yield* HostProcess.Platform) === "linux" &&
+    (yield* tryRevealLinuxItem(launch.target))
+  ) {
+    return;
+  }
+  yield* launchEditorProcess(launch);
 });
 
 const launchAndUnref = Effect.fn("externalLauncher.launchAndUnref")(function* (
@@ -659,7 +720,15 @@ const launchAndUnref = Effect.fn("externalLauncher.launchAndUnref")(function* (
   onError: (cause: unknown) => ExternalLauncherError,
 ): Effect.fn.Return<void, ExternalLauncherError, ChildProcessSpawner.ChildProcessSpawner> {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const command = ChildProcess.make(launch.command, launch.args, launch.options);
+  // The desktop app runs this server with ELECTRON_RUN_AS_NODE. A launched file
+  // manager or browser passes its environment on to everything started from it,
+  // so any Electron app opened from there would start as plain Node and exit.
+  const { ELECTRON_RUN_AS_NODE: _runAsNode, ...env } = yield* HostProcess.Environment;
+  const command = ChildProcess.make(launch.command, launch.args, {
+    ...launch.options,
+    env,
+    extendEnv: false,
+  });
 
   yield* spawner.spawn(command).pipe(
     Effect.flatMap((handle) => handle.unref),
@@ -805,9 +874,9 @@ export const make = Effect.gen(function* () {
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       ),
     launchEditor: (input) =>
-      provideCommandResolutionServices(
-        Effect.flatMap(resolveEditorLaunch(input), launchEditorProcess),
-      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+      provideCommandResolutionServices(launchEditor(input)).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      ),
   });
 });
 

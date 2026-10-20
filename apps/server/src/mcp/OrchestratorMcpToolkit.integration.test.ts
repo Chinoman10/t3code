@@ -136,16 +136,15 @@ const delegatedTaskStatusTranscriptFile = new URL(
   import.meta.url,
 );
 
-const readDelegatedTaskStatusTranscript = Effect.fn("readDelegatedTaskStatusTranscript")(
-  function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const text = yield* fs.readFileString(
-      decodeURIComponent(delegatedTaskStatusTranscriptFile.pathname),
-    );
-    return yield* decodeProviderReplayNdjson(text);
-  },
-  Effect.provide(NodeServices.layer),
-);
+const readDelegatedTaskStatusTranscript = Effect.fn("readDelegatedTaskStatusTranscript")(function* (
+  followupResult: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const text = yield* fs.readFileString(
+    decodeURIComponent(delegatedTaskStatusTranscriptFile.pathname),
+  );
+  return yield* decodeProviderReplayNdjson(text.replaceAll(queuedFollowupResult, followupResult));
+}, Effect.provide(NodeServices.layer));
 
 interface CapturedTurn {
   readonly instanceId: ProviderInstanceId;
@@ -198,6 +197,9 @@ function makeDeterministicAdapter(input: {
     turn: ProviderAdapter.ProviderAdapterV2TurnInput,
   ) => Deferred.Deferred<void> | undefined;
   readonly response: (turn: ProviderAdapter.ProviderAdapterV2TurnInput) => string;
+  readonly steerReceived?: (
+    steer: ProviderAdapter.ProviderAdapterV2SteerInput,
+  ) => Deferred.Deferred<void> | undefined;
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
   return {
     instanceId: input.instanceId,
@@ -365,7 +367,12 @@ function makeDeterministicAdapter(input: {
                 },
               ]);
             }),
-          steerTurn: () => Effect.void,
+          steerTurn: (steer) => {
+            const received = input.steerReceived?.(steer);
+            return received === undefined
+              ? Effect.void
+              : Deferred.succeed(received, undefined).pipe(Effect.asVoid);
+          },
           interruptTurn: ({ providerThread, providerTurnId }) =>
             Effect.gen(function* () {
               const turnInput = turnInputs.get(providerTurnId);
@@ -529,6 +536,7 @@ describe("orchestrator MCP toolkit", () => {
         Effect.gen(function* () {
           const cwd = yield* checkpointWorkspace("orchestrator-mcp-toolkit");
           const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const steerReceivedGates = new Map<string, Deferred.Deferred<void>>();
           const parentTerminalGates = new Map<ThreadId, Deferred.Deferred<void>>();
           const deliveryTerminalGates = new Map<ThreadId, Deferred.Deferred<void>>();
           const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
@@ -564,6 +572,7 @@ describe("orchestrator MCP toolkit", () => {
                 turn.message.text === delegatedPrompt
                   ? delegatedResult
                   : `Claude completed: ${turn.message.text}`,
+              steerReceived: (steer) => steerReceivedGates.get(steer.message.text),
             }),
           ]);
           const continuationOffers = yield* Ref.make<
@@ -1747,10 +1756,10 @@ describe("orchestrator MCP toolkit", () => {
               hasPendingChildRuns: false,
               latestTerminalRunId: delegated.childRunId,
               latestTerminalStatus: "completed",
-              latestTerminalSummary: delegatedResult,
+              latestTerminalSummary: null,
+              latestTerminalResultContextTransferId: null,
             });
             expect(delegatedStatus.resultContextTransferId).not.toBeNull();
-            expect(delegatedStatus.latestTerminalResultContextTransferId).not.toBeNull();
 
             yield* expectOffersToStay(0);
 
@@ -1854,6 +1863,16 @@ describe("orchestrator MCP toolkit", () => {
                 legacyDelegatedRun,
               ),
             ).toBe(false);
+            const heldFollowupCall = yield* invoke("t3_thread_send", {
+              threadId: delegated.childThreadId,
+              message: "This queued follow-up must remain stopped until resumed.",
+              mode: "queue",
+              clientRequestId: "delegated-child-held-followup",
+            });
+            const heldFollowup = yield* decodeThreadSendResult(
+              heldFollowupCall.structuredContent,
+            ).pipe(Effect.orDie);
+            expect(heldFollowup.taskId).toBeDefined();
             const completedTaskCancelCall = yield* invoke("task_cancel", {
               taskId: delegated.taskId,
               reason: "Stop the child's later work too.",
@@ -1894,12 +1913,169 @@ describe("orchestrator MCP toolkit", () => {
               latestTerminalStatus: "interrupted",
             });
 
+            yield* waitForProjection(orchestrator, parentThreadId, (projection) =>
+              projection.subagents.some(
+                (task) => task.id === heldFollowup.taskId && task.status === "idle",
+              ),
+            );
+            expect(
+              (yield* orchestrator.getThreadProjection(delegated.childThreadId)).runs.find(
+                (run) => run.id === heldFollowup.runId,
+              ),
+            ).toMatchObject({ status: "queued", queueHeld: true, startedAt: null });
+            const cancelHeldCall = yield* invoke("task_cancel", {
+              taskId: heldFollowup.taskId,
+              clientRequestId: "cancel-held-delegated-followup",
+            });
+            expect(
+              (yield* decodeTaskCancelResult(cancelHeldCall.structuredContent).pipe(Effect.orDie))
+                .status,
+            ).toBe("cancel_requested");
+            yield* waitForProjection(orchestrator, parentThreadId, (projection) =>
+              projection.subagents.some(
+                (task) => task.id === heldFollowup.taskId && task.status === "cancelled",
+              ),
+            );
+            expect(
+              (yield* orchestrator.getThreadProjection(delegated.childThreadId)).runs.find(
+                (run) => run.id === heldFollowup.runId,
+              ),
+            ).toMatchObject({ status: "cancelled", startedAt: null });
+
             expect(childFollowup.taskId).toBeDefined();
             expect(activeChildFollowup.taskId).toBeDefined();
             yield* waitForContinuationOffers(2);
             yield* expectOffersToStay(2);
             yield* invoke("task_status", { taskId: childFollowup.taskId });
             yield* invoke("task_status", { taskId: activeChildFollowup.taskId });
+            yield* Ref.set(continuationOffers, []);
+
+            // A send into a child run the server started has no task to join.
+            // It gets its own task only when it starts a new attempt; a steer
+            // into the running attempt leaves no run that could settle one.
+            const childSteerText = "Include the parent's latest guidance before finishing.";
+            const steerIntoUntaskedChildRun = (
+              target: { readonly providerInstanceId: ProviderInstanceId; readonly model: string },
+              name: string,
+            ) =>
+              Effect.gen(function* () {
+                const delegateCall = yield* invoke("delegate_task", {
+                  task: "Inspect the steering boundary and return the result.",
+                  target,
+                  mode: "wait",
+                  timeoutMs: 10_000,
+                  clientRequestId: `${name}-delegate`,
+                });
+                const child = yield* decodeDelegateTaskResult(delegateCall.structuredContent).pipe(
+                  Effect.orDie,
+                );
+                expect(child.status).toBe("completed");
+                const messageId = MessageId.make(`message:mcp-child:${name}`);
+                yield* orchestrator.dispatch({
+                  type: "message.dispatch",
+                  createdBy: "agent",
+                  creationSource: "server",
+                  commandId: CommandId.make(`command:mcp-child:${name}`),
+                  threadId: child.childThreadId,
+                  messageId,
+                  text: cancellationPrompt,
+                  attachments: [],
+                  modelSelection: { instanceId: target.providerInstanceId, model: target.model },
+                  dispatchMode: { type: "start_immediately" },
+                });
+                const running = yield* waitForProjection(
+                  orchestrator,
+                  child.childThreadId,
+                  (projection) => {
+                    const run = projection.runs.find((row) => row.userMessageId === messageId);
+                    return (
+                      run?.status === "running" &&
+                      projection.providerTurns.some(
+                        (turn) => turn.nodeId === run.rootNodeId && turn.status === "running",
+                      )
+                    );
+                  },
+                );
+                const run = running.runs.find((row) => row.userMessageId === messageId)!;
+                expect(run.delegatedTaskId).toBeUndefined();
+                const sendCall = yield* invoke("t3_thread_send", {
+                  threadId: child.childThreadId,
+                  message: childSteerText,
+                  mode: "steer",
+                  clientRequestId: `${name}-steer`,
+                });
+                const sent = yield* decodeThreadSendResult(sendCall.structuredContent).pipe(
+                  Effect.orDie,
+                );
+                expect(sent).toMatchObject({ runId: run.id, delivery: "steered" });
+                return { child, sent };
+              });
+            const waitForChildRun = (
+              childThreadId: ThreadId,
+              runId: string,
+              status: "completed" | "interrupted",
+            ) =>
+              waitForProjection(orchestrator, childThreadId, (projection) =>
+                projection.runs.some((run) => run.id === runId && run.status === status),
+              );
+
+            // Claude steers into the running turn, which then ends.
+            const steerReceived = yield* Deferred.make<void>();
+            steerReceivedGates.set(childSteerText, steerReceived);
+            const steeredSend = yield* steerIntoUntaskedChildRun(
+              { providerInstanceId: claudeInstanceId, model: claudeModel },
+              "steer-untasked-run",
+            );
+            // A steer that misses the turn is sent again as its own run, so
+            // end the turn only once the steer reached it.
+            yield* Deferred.await(steerReceived);
+            steerReceivedGates.delete(childSteerText);
+            yield* invoke("t3_thread_interrupt", {
+              threadId: steeredSend.child.childThreadId,
+              runId: steeredSend.sent.runId,
+              clientRequestId: "steer-untasked-run-interrupt",
+            });
+            yield* waitForChildRun(
+              steeredSend.child.childThreadId,
+              steeredSend.sent.runId,
+              "interrupted",
+            );
+            expect(
+              (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.filter(
+                (task) =>
+                  task.origin === "app_owned" &&
+                  task.childThreadId === steeredSend.child.childThreadId &&
+                  task.status === "running",
+              ),
+            ).toEqual([]);
+            expect(steeredSend.sent.taskId).toBeUndefined();
+
+            // This Codex session has active steering off, so the send restarts the
+            // turn as a new attempt that owns the follow-up task and settles it.
+            const restarted = yield* steerIntoUntaskedChildRun(
+              { providerInstanceId: codexInstanceId, model: codexModel },
+              "restart-untasked-run",
+            );
+            const restartedTaskId = restarted.sent.taskId;
+            expect(restartedTaskId).toBeDefined();
+            yield* waitForChildRun(
+              restarted.child.childThreadId,
+              restarted.sent.runId,
+              "completed",
+            );
+            yield* waitForProjection(orchestrator, parentThreadId, (projection) =>
+              projection.subagents.some(
+                (task) => task.id === restartedTaskId && task.status === "completed",
+              ),
+            );
+            expect(
+              (yield* orchestrator.getThreadProjection(restarted.child.childThreadId)).runs.find(
+                (run) => run.id === restarted.sent.runId,
+              )?.delegatedTaskId,
+            ).toBe(restartedTaskId);
+            yield* invoke("task_status", { taskId: steeredSend.child.taskId });
+            yield* invoke("task_status", { taskId: restarted.child.taskId });
+            yield* invoke("task_status", { taskId: restartedTaskId });
             yield* Ref.set(continuationOffers, []);
 
             const repeatedDelegatedCall = yield* invoke("delegate_task", {
@@ -2249,6 +2425,58 @@ describe("orchestrator MCP toolkit", () => {
               Effect.orDie,
             );
             expect(unlinked.linkedPullRequest).toBeNull();
+
+            // Links added through thread.pull-request.link leave linkedPullRequest unchanged.
+            yield* orchestrator.dispatch({
+              type: "thread.pull-request.link",
+              commandId: CommandId.make("command:mcp-empty:link-other-repository"),
+              threadId: emptyThread.threadId,
+              host: "github.com",
+              repository: "octo/other-repo",
+              number: 42,
+              url: "https://github.com/octo/other-repo/pull/42",
+              source: "agent",
+            });
+            yield* orchestrator.dispatch({
+              type: "thread.pull-request.link",
+              commandId: CommandId.make("command:mcp-empty:link-dismissed"),
+              threadId: emptyThread.threadId,
+              host: "github.com",
+              repository: "octo/other-repo",
+              number: 43,
+              url: "https://github.com/octo/other-repo/pull/43",
+              source: "stack-dismissed",
+            });
+            const otherRepositoryLink = {
+              host: "github.com",
+              repository: "octo/other-repo",
+              number: 42,
+              url: "https://github.com/octo/other-repo/pull/42",
+              source: "agent",
+              state: null,
+            };
+            const otherRepositoryReadCall = yield* invoke("t3_thread_read", {
+              threadId: emptyThread.threadId,
+            });
+            const otherRepositoryRead = yield* decodeThreadReadResult(
+              otherRepositoryReadCall.structuredContent,
+            ).pipe(Effect.orDie);
+            expect(otherRepositoryRead.thread).toMatchObject({
+              linkedPullRequest: null,
+              pullRequests: [otherRepositoryLink],
+            });
+            const otherRepositoryListCall = yield* invoke("t3_thread_list", { limit: 100 });
+            const otherRepositoryList = yield* decodeThreadListResult(
+              otherRepositoryListCall.structuredContent,
+            ).pipe(Effect.orDie);
+            expect(
+              otherRepositoryList.threads.find(
+                (thread) => thread.threadId === emptyThread.threadId,
+              ),
+            ).toMatchObject({ linkedPullRequest: null, pullRequests: [otherRepositoryLink] });
+            expect(
+              otherRepositoryList.threads.find((thread) => thread.threadId === parentThreadId),
+            ).toMatchObject({ pullRequests: [] });
 
             const regenerateCall = yield* invoke("t3_thread_update", {
               threadId: emptyThread.threadId,
@@ -3761,11 +3989,14 @@ describe("orchestrator MCP toolkit", () => {
       ),
   );
 
-  it.live("reports running and queued child follow-ups from a Codex replay transcript", () =>
+  it.live.each([
+    { label: "distinct", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
+    { label: "identical", result: delegatedResult, latestSummary: null },
+  ])("reports $label child results", ({ result, latestSummary }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const cwd = yield* checkpointWorkspace("delegated-task-status");
-        const rawTranscript = yield* readDelegatedTaskStatusTranscript();
+        const rawTranscript = yield* readDelegatedTaskStatusTranscript(result);
         const transcript = yield* CodexOrchestratorReplayHarness.decodeTranscript(
           materializeReplayTranscriptWorkspace(rawTranscript, cwd),
         );
@@ -3934,12 +4165,10 @@ describe("orchestrator MCP toolkit", () => {
             hasPendingChildRuns: false,
             latestTerminalRunId: delegated.childRunId,
             latestTerminalStatus: "completed",
-            latestTerminalSummary: delegatedResult,
+            latestTerminalSummary: null,
+            latestTerminalResultContextTransferId: null,
           });
           expect(delegated.resultContextTransferId).not.toBeNull();
-          expect(delegated.latestTerminalResultContextTransferId).toBe(
-            delegated.resultContextTransferId,
-          );
 
           const delegatedChild = yield* orchestrator.getThreadProjection(delegated.childThreadId);
           expect(delegatedChild.thread.lineage.relationshipToParent).toBe("subagent");
@@ -4033,8 +4262,8 @@ describe("orchestrator MCP toolkit", () => {
             hasPendingChildRuns: true,
             latestTerminalRunId: delegated.childRunId,
             latestTerminalStatus: "completed",
-            latestTerminalSummary: delegatedResult,
-            latestTerminalResultContextTransferId: delegated.resultContextTransferId,
+            latestTerminalSummary: null,
+            latestTerminalResultContextTransferId: null,
           });
 
           const finalSequence = yield* orchestrator.getThreadEventSequence(delegated.childThreadId);
@@ -4107,7 +4336,7 @@ describe("orchestrator MCP toolkit", () => {
             finishedParent.subagents.find((task) => task.id === followupTasks[1]!.id),
           ).toMatchObject({
             status: "completed",
-            result: queuedFollowupResult,
+            result,
           });
           expect(
             finishedParent.contextTransfers.filter(
@@ -4134,9 +4363,18 @@ describe("orchestrator MCP toolkit", () => {
             hasPendingChildRuns: false,
             latestTerminalRunId: queuedFollowup.runId,
             latestTerminalStatus: "completed",
-            latestTerminalSummary: queuedFollowupResult,
+            latestTerminalSummary: latestSummary,
           });
-          expect(finalStatus.latestTerminalResultContextTransferId).not.toBeNull();
+          const followupTransfer = finishedParent.contextTransfers.find(
+            (transfer) =>
+              transfer.type === "subagent_result" &&
+              transfer.sourcePoint.runId === queuedFollowup.runId,
+          );
+          expect(followupTransfer).toBeDefined();
+          expect(finalStatus.latestTerminalResultContextTransferId).toBe(followupTransfer?.id);
+          expect(finalStatus.latestTerminalResultContextTransferId).not.toBe(
+            delegated.resultContextTransferId,
+          );
           const read = yield* invoke("t3_thread_read", {
             threadId: delegated.childThreadId,
             limit: 100,
