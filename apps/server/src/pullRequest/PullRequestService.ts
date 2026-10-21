@@ -3111,7 +3111,7 @@ export const make = Effect.gen(function* () {
           if (read === undefined) return Effect.succeed(null);
           return read({
             cwd: project.project.workspaceRoot,
-            repository: project.repository,
+            repository: providerRepository(project),
             host: project.host,
             number: ref.number,
           }).pipe(

@@ -875,7 +875,14 @@ it.effect(
       let generation = 1;
       const helperPaths: string[] = [];
       const lookups: string[] = [];
-      const requests: Array<{ operation: string; authorization: string | undefined }> = [];
+      const requests: Array<{
+        operation: string;
+        authorization: string | undefined;
+        repository: string | undefined;
+        credentialRepository: string | undefined;
+        fingerprint: string | undefined;
+        scope: string;
+      }> = [];
       const host = TestSourceControlHost.layer({
         process: {
           run: (input) =>
@@ -899,25 +906,48 @@ it.effect(
       const http = Layer.succeed(
         HttpClient.HttpClient,
         HttpClient.make((request) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             const operation = request.url.endsWith("/user")
               ? "user"
               : request.body._tag === "Uint8Array"
                 ? new TextDecoder().decode(request.body.body)
                 : "";
-            requests.push({ operation, authorization: request.headers.authorization });
+            const pin = yield* GitHubRequestPolicy.PinnedGitHubCredential;
+            requests.push({
+              operation,
+              authorization: request.headers.authorization,
+              repository: pin?.repository,
+              credentialRepository: pin?.credentialRepository,
+              fingerprint: pin?.credentialFingerprint,
+              scope: yield* SourceControlRateLimit.CredentialScope,
+            });
             return HttpClientResponse.fromWeb(
               request,
               new Response(
                 JSON.stringify(
                   operation === "user"
                     ? { id: 101, login: "Chinoman10" }
-                    : {
-                        data: {
-                          repository: { pullRequest: { id: "PR_1" } },
-                          _0_markFileAsViewed: { clientMutationId: null },
+                    : operation.includes("PullRequestFileStats")
+                      ? {
+                          data: {
+                            repository: {
+                              pullRequest: {
+                                files: {
+                                  nodes: [
+                                    { path: "src/private.ts", additions: generation, deletions: 1 },
+                                  ],
+                                  pageInfo: { hasNextPage: false, endCursor: null },
+                                },
+                              },
+                            },
+                          },
+                        }
+                      : {
+                          data: {
+                            repository: { pullRequest: { id: "PR_1" } },
+                            _0_markFileAsViewed: { clientMutationId: null },
+                          },
                         },
-                      },
                 ),
                 { headers: { "content-type": "application/json" } },
               ),
@@ -978,6 +1008,7 @@ it.effect(
         getReviewThreadComments: (input) =>
           lookup(input).pipe(Effect.as({ comments: [], nextCursor: null })),
         setFilesViewed: native.setFilesViewed!,
+        getFileStats: native.getFileStats!,
       });
       const service = yield* makeService({
         projects: [
@@ -998,9 +1029,30 @@ it.effect(
         ["ownera/repo"],
       );
       assert.strictEqual((yield* service.detail(ref)).body, "fake-OwnerA-1");
+      const firstBreakdown = yield* service.changeBreakdown(ref);
+      assert.deepStrictEqual(firstBreakdown?.code, { additions: 1, deletions: 1 });
+      assert.deepStrictEqual(yield* service.changeBreakdown(ref), firstBreakdown);
       yield* credentials.invalidate("github.com", "ownera/repo");
       generation = 2;
       assert.strictEqual((yield* service.detail(ref)).body, "fake-OwnerA-2");
+      const secondBreakdown = yield* service.changeBreakdown(ref);
+      assert.deepStrictEqual(secondBreakdown?.code, { additions: 2, deletions: 1 });
+      assert.deepStrictEqual(yield* service.changeBreakdown(ref), secondBreakdown);
+      const fileStatsRequests = requests.filter((request) =>
+        request.operation.includes("PullRequestFileStats"),
+      );
+      assert.strictEqual(fileStatsRequests.length, 2);
+      assert.deepStrictEqual(
+        fileStatsRequests.map((request) => request.authorization),
+        ["Bearer fake-OwnerA-1", "Bearer fake-OwnerA-2"],
+      );
+      assert.notStrictEqual(fileStatsRequests[0]?.fingerprint, fileStatsRequests[1]?.fingerprint);
+      for (const request of fileStatsRequests) {
+        assert.strictEqual(request.repository, "ownera/repo");
+        assert.strictEqual(request.credentialRepository, "ownera/repo");
+        assert.ok(request.fingerprint);
+        assert.strictEqual(request.scope, request.fingerprint);
+      }
       assert.strictEqual(
         (yield* service.listStats({ refs: [ref] })).stats[0]?.repository,
         "ownera/repo",
@@ -1370,19 +1422,30 @@ it.effect.each([false, true])(
       const reads: string[] = [];
       const service = yield* makeService({
         projects: [
-          project({ id: "p1", title: "web", workspaceRoot: "/a", repository: "acme/web" }),
+          project({
+            id: "p1",
+            title: "web",
+            workspaceRoot: "/a",
+            repository: "acme/web",
+            remoteUrl: "https://github.com/Acme/Web.git",
+          }),
         ],
         providers: [
           fakeProvider(SourceControlProviderKind.make("github"), {
-            withVerifiedCredential: (_, use) =>
-              Effect.suspend(() =>
-                use({ accountId: "101", viewer: "octocat", credentialFingerprint: credential }),
-              ),
+            withVerifiedCredential: (input, use) =>
+              Effect.suspend(() => {
+                assert.strictEqual(input.repository, "Acme/Web");
+                return use({
+                  accountId: "101",
+                  viewer: "octocat",
+                  credentialFingerprint: credential,
+                });
+              }),
             getFileStats: (input) =>
               Effect.sync(() => {
                 assert.deepStrictEqual(input, {
                   cwd: "/a",
-                  repository: "acme/web",
+                  repository: "Acme/Web",
                   host: "github.com",
                   number: 1,
                 });
