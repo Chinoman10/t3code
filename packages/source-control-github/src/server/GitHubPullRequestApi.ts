@@ -60,6 +60,7 @@ import {
   pullRequestChecksFromContexts,
   decodeWorkflowRunsJson,
   type GitHubPullRequestCore,
+  type GitHubPullRequestFileStat,
   type GitHubPullRequestWatchFingerprint,
   isSubjectOfPullRequest,
   LenientPullRequestList,
@@ -72,6 +73,7 @@ import {
   toPullRequestCheckContextsPage,
   toPullRequestCore,
   toPullRequestFilesViewedPage,
+  toPullRequestFileStatsPage,
   toPullRequestHeads,
   toPullRequestNodeId,
   toPullRequestPreview,
@@ -413,6 +415,11 @@ export interface GitHubPullRequestFilesViewed {
   readonly truncated: boolean;
 }
 
+export interface GitHubPullRequestFileStats {
+  readonly files: ReadonlyArray<GitHubPullRequestFileStat>;
+  readonly truncated: boolean;
+}
+
 export class GitHubPullRequestApi extends Context.Service<
   GitHubPullRequestApi,
   {
@@ -569,6 +576,13 @@ export class GitHubPullRequestApi extends Context.Service<
       readonly host: string;
       readonly number: number;
     }) => Effect.Effect<GitHubPullRequestFilesViewed, GitHubPullRequestApiError>;
+
+    readonly getPullRequestFileStats: (input: {
+      readonly cwd: string;
+      readonly repository: string;
+      readonly host: string;
+      readonly number: number;
+    }) => Effect.Effect<GitHubPullRequestFileStats, GitHubPullRequestApiError>;
 
     /**
      * GitHub takes a single path per mutation, so a burst is batched with aliases into one
@@ -2831,6 +2845,34 @@ export const make = Effect.gen(function* () {
       );
     },
 
+    getPullRequestFileStats: (input) => {
+      const { owner, name } = parseRepositorySelector(input.repository);
+      const target = { ...input, operation: "getPullRequestFileStats" };
+      return readPages(
+        GraphQLClient.pages(client.PullRequestFileStats, {
+          variables: { owner, name, number: input.number },
+          connection: (result) => {
+            const page = toPullRequestFileStatsPage(result);
+            return {
+              ...page,
+              pageInfo: { hasNextPage: page.nextCursor !== null, endCursor: page.nextCursor },
+            };
+          },
+        }),
+        {
+          ...target,
+          maxPages: FILES_VIEWED_MAX_PAGES,
+          hasNextPage: (page) => page.nextCursor !== null,
+        },
+      ).pipe(
+        graphql(target),
+        Effect.map(({ pages, truncated }) => ({
+          files: pages.flatMap((page) => page.files),
+          truncated,
+        })),
+      );
+    },
+
     setPullRequestFilesViewed: (input) => {
       if (input.files.length === 0) return Effect.void;
       const target = { ...input, operation: "setPullRequestFilesViewed" };
@@ -2961,6 +3003,8 @@ export const make = Effect.gen(function* () {
       withRepositoryCredential(input, service.getPullRequestDiffFileContents(input)),
     getPullRequestFilesViewed: (input) =>
       withRepositoryCredential(input, service.getPullRequestFilesViewed(input)),
+    getPullRequestFileStats: (input) =>
+      withRepositoryCredential(input, service.getPullRequestFileStats(input)),
     setPullRequestFilesViewed: (input) =>
       withRepositoryCredential(input, service.setPullRequestFilesViewed(input)),
     listReviewThreadComments: (input) =>

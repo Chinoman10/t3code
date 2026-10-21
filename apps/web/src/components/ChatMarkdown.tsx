@@ -1,3 +1,4 @@
+import { formatFilePathForClipboard } from "@t3tools/client-runtime/media-actions";
 import { MarkdownFindContext, findRevealRef } from "./chat/markdownFindContext";
 import {
   buildFileLinkParentSuffixByPath,
@@ -218,7 +219,7 @@ import {
   pickWorkspaceBasenameMatch,
   stripRepeatedWorkspacePrefix,
   WORKSPACE_BASENAME_LOOKUP_LIMIT,
-} from "../workspaceBasenameLookup";
+} from "@t3tools/client-runtime/workspace-basename-lookup";
 import {
   parseChangeRequestUrl,
   pullRequestCandidateUrlFromReferenceAutolink,
@@ -1106,7 +1107,7 @@ function MarkdownMermaidCodeBlock({
               </pre>
             }
           >
-            <MermaidDiagram source={code} theme={theme} onExpand={onExpand} />
+            <MermaidDiagram source={code} onExpand={onExpand} />
           </Suspense>
           {searching ? (
             <pre ref={sourceRevealRef} hidden aria-hidden>
@@ -2119,7 +2120,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
       return;
     }
 
-    const value = resolveValue();
+    const value = resolveValue().then((text) => formatFilePathForClipboard(text, targetPath));
     // Start the write before workspace lookup finishes so Safari retains the user gesture.
     const write =
       typeof navigator.clipboard.write === "function" && typeof ClipboardItem !== "undefined"
