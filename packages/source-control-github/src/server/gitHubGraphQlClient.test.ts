@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as TestClock from "effect/testing/TestClock";
@@ -84,6 +85,17 @@ const readStats = (host: string, number = 7, repository?: string) =>
 const stats = { additions: 3, deletions: 1 };
 
 describe("GitHubGraphQlAuth", () => {
+  it("separates unpinned target repositories even with the same rate-limit scope", () => {
+    const context = (repository: string) =>
+      Context.make(GitHubGraphQlClient.GitHubGraphQlTarget, {
+        host: "github.com",
+        repository,
+        operation: "stats",
+      });
+    expect(GitHubGraphQlClient.batchKey(context("OwnerA/Repo"))).not.toBe(
+      GitHubGraphQlClient.batchKey(context("OwnerB/Repo")),
+    );
+  });
   it.effect("passes the explicit repository through the generated GraphQL request policy", () => {
     const { layer, requests, selections } = harness(
       () => json({ data: { _0_repository: { pullRequest: stats } } }),

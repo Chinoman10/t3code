@@ -243,8 +243,8 @@ export const makeDiscovery = Effect.gen(function* () {
       const savedToken = (settings.tokens["github.com"] ?? "").trim() !== "";
       const variable = environmentTokenVariable(environment);
       const tokenSource = savedToken ? "the token saved in Settings" : variable;
-      const repositoryFallback = (item: SourceControlProviderDiscoveryItem) =>
-        Effect.gen(function* () {
+      const repositoryFallback = Effect.fn("GitHubSourceControlProvider.repositoryFallback")(
+        function* (item: SourceControlProviderDiscoveryItem) {
           if (
             environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS !== "1" ||
             item.auth.status === "authenticated"
@@ -275,7 +275,8 @@ export const makeDiscovery = Effect.gen(function* () {
                 }),
               }
             : item;
-        });
+        },
+      );
       // A host turned off in Settings stays off even with a token.
       if (settings.hosts["github.com"]?.enabled === false) return cli;
       if (tokenSource === null) return yield* repositoryFallback(cli);
@@ -556,12 +557,12 @@ export const make = Effect.gen(function* () {
    * Runs a generated read against `target`. GitHub's refusals and `errors` fail the way REST
    * ones do; an answer that does not decode is a `decodeDetail` failure.
    */
-  const graphqlRead = <A, E, R>(
-    target: GitHubGraphQlClient.GitHubGraphQlTarget["Service"],
-    decodeDetail: string,
-    effect: Effect.Effect<A, E, R>,
-  ) =>
-    Effect.gen(function* () {
+  const graphqlRead = Effect.fn("GitHubSourceControlProvider.graphqlRead")(
+    function* <A, E, R>(
+      target: GitHubGraphQlClient.GitHubGraphQlTarget["Service"],
+      decodeDetail: string,
+      effect: Effect.Effect<A, E, R>,
+    ) {
       if (environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS !== "1")
         return yield* effect.pipe(GitHubGraphQlClient.call(target));
       const credential = yield* api.credential(target.host, target.repository);
@@ -577,13 +578,16 @@ export const make = Effect.gen(function* () {
             : { credentialRepository: credential.credentialRepository }),
         }),
       );
-    }).pipe(
-      Effect.mapError((error) =>
-        GraphQLClientError.isGraphQLClientError(error)
-          ? failure(decodeDetail, error)
-          : fromGitHubApiError(error as GitHubRequestPolicy.GitHubApiError),
+    },
+    (effect, _target, decodeDetail) =>
+      effect.pipe(
+        Effect.mapError((error) =>
+          GraphQLClientError.isGraphQLClientError(error)
+            ? failure(decodeDetail, error)
+            : fromGitHubApiError(error as GitHubRequestPolicy.GitHubApiError),
+        ),
       ),
-    );
+  );
 
   const rest = (input: GitHubRest.GitHubRestInput, notFoundDetail?: string) =>
     api.rest(input).pipe(Effect.mapError((error) => fromGitHubApiError(error, notFoundDetail)));

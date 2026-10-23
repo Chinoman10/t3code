@@ -224,8 +224,10 @@ export const batchKey = (context: Context.Context<GitHubGraphQlTarget>) =>
   JSON.stringify([
     Context.getOrElse(context, GitHubRequestPolicy.PinnedGitHubCredential, () => null)
       ?.credentialFingerprint ?? null,
-    Context.getOrElse(context, GitHubRequestPolicy.PinnedGitHubCredential, () => null)
-      ?.repository ?? null,
+    Context.getUnsafe(context, GitHubGraphQlTarget).repository ??
+      Context.getOrElse(context, GitHubRequestPolicy.PinnedGitHubCredential, () => null)
+        ?.repository ??
+      null,
     Context.getOrElse(context, SourceControlRateLimit.CredentialScope, () => ""),
   ]);
 

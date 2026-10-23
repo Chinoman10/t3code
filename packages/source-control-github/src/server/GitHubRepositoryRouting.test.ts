@@ -16,6 +16,8 @@ import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSour
 import * as GitHubApi from "./GitHubRest.ts";
 import * as GitHubPullRequestApi from "./GitHubPullRequestApi.ts";
 import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
+import * as GitHubRequestPolicy from "./GitHubRequestPolicy.ts";
+import { makeChecksRevalidator } from "./gitHubConditionalChecks.ts";
 
 function harness(
   refusalStatus = 401,
@@ -24,6 +26,7 @@ function harness(
     readonly missingOwners?: ReadonlyArray<string>;
     readonly fallbackGh?: boolean;
     readonly sameToken?: boolean;
+    readonly rateLimited?: boolean;
   } = {},
 ) {
   const requests: HttpClientRequest.HttpClientRequest[] = [];
@@ -42,7 +45,10 @@ function harness(
       const token = request.headers.authorization ?? "";
       const pathname = new URL(request.url).pathname;
       const result = refused.has(token)
-        ? json({ message: "Bad credentials" }, refusalStatus)
+        ? json(
+            { message: options.rateLimited ? "API rate limit exceeded" : "Bad credentials" },
+            refusalStatus,
+          )
         : pathname === "/user"
           ? json({ id: 123, login: "Chinoman10" })
           : pathname.startsWith("/repos/")
@@ -128,6 +134,47 @@ function harness(
 }
 
 describe("native GitHub repository routing", () => {
+  it.effect("forwards the repository to every conditional checks endpoint", () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const ref = { cwd: "/w", host: "github.com", repository: "OwnerA/Repo", number: 1 };
+      const sha = "a".repeat(40);
+      const revalidate = yield* makeChecksRevalidator.pipe(
+        Effect.provideService(GitHubApi.GitHubRest, {
+          credential: () => Effect.die("already pinned"),
+          rest: (input) => {
+            expect(input.repository).toBe(ref.repository);
+            expect(input.host).toBe(ref.host);
+            calls.push(input.path);
+            return Effect.succeed({
+              status: 200,
+              headers: {},
+              body: JSON.stringify({ head: { sha, repo: { id: 1 } }, base: { repo: { id: 1 } } }),
+              truncated: false,
+              invalidUtf8: false,
+            });
+          },
+        }),
+      );
+      const result = yield* revalidate(
+        ref,
+        Effect.succeed({ state: "open" as const, checks: [], headSha: sha }),
+      ).pipe(
+        Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
+          host: ref.host,
+          repository: "ownera/repo",
+          token: Redacted.make("synthetic"),
+          credentialFingerprint: "synthetic-fingerprint",
+        }),
+      );
+      expect(result).toEqual({ state: "open", checks: [] });
+      expect(calls).toEqual([
+        "repos/OwnerA/Repo/pulls/1",
+        `repos/OwnerA/Repo/commits/${sha}/check-runs?filter=all&per_page=100&page=1`,
+        `repos/OwnerA/Repo/commits/${sha}/status?per_page=100&page=1`,
+      ]);
+    }),
+  );
   it.effect("a verified fallback credential stays scoped to the requested repository", () => {
     const { layer, requests, helperPaths } = harness(401, false, { missingOwners: ["OwnerA"] });
     return Effect.gen(function* () {
@@ -298,6 +345,32 @@ describe("native GitHub repository routing", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("keeps scoped rate-limit 403 cached and leaves repository B unpaused", () => {
+    const { layer, requests, refused, helperPaths } = harness(403, false, { rateLimited: true });
+    refused.add("Bearer fake-OwnerA-1");
+    return Effect.gen(function* () {
+      const api = yield* GitHubApi.GitHubRest;
+      const error = yield* api
+        .rest({
+          host: "github.com",
+          repository: "OwnerA/Repo",
+          operation: "test",
+          path: "repos/OwnerA/Repo",
+        })
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("GitHubApiRateLimitError");
+      yield* api.credential("github.com", "OwnerA/Repo");
+      yield* api.rest({
+        host: "github.com",
+        repository: "OwnerB/Repo",
+        operation: "test",
+        path: "repos/OwnerB/Repo",
+      });
+      expect(requests).toHaveLength(2);
+      expect(helperPaths).toEqual(["OwnerA/Repo.git", "OwnerB/Repo.git"]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("invalidates a non-rate-limited 403 without retrying with another token", () => {
     const { layer, requests, refused, helperPaths, rotate } = harness(403);
     return Effect.gen(function* () {
@@ -362,6 +435,35 @@ describe("native GitHub repository routing", () => {
         Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
         Effect.provideService(HostProcess.WorkingDirectory, "/trusted"),
       );
+    },
+  );
+
+  it.effect(
+    "keeps create-owner identity and repository creation on the explicit repository credential",
+    () => {
+      const { layer, requests, helperPaths } = harness();
+      return Effect.gen(function* () {
+        const provider = yield* GitHubSourceControlProvider.make;
+        for (const repository of ["OwnerA/NewRepo", "OwnerB/NewRepo"]) {
+          // The mock intentionally refuses creation; this is a routing check, not a mutation.
+          yield* provider
+            .createRepository({ cwd: "/synthetic-checkout", repository, visibility: "private" })
+            .pipe(Effect.result);
+        }
+        expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+          "/user",
+          "/orgs/OwnerA/repos",
+          "/user",
+          "/orgs/OwnerB/repos",
+        ]);
+        expect(requests.map((request) => request.headers.authorization)).toEqual([
+          "Bearer fake-OwnerA-1",
+          "Bearer fake-OwnerA-1",
+          "Bearer fake-OwnerB-1",
+          "Bearer fake-OwnerB-1",
+        ]);
+        expect(helperPaths).toEqual(["OwnerA/NewRepo.git", "OwnerB/NewRepo.git"]);
+      }).pipe(Effect.provide(layer));
     },
   );
 

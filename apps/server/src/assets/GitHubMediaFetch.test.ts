@@ -15,6 +15,133 @@ const asset = (url: string) => ({
 
 describe("repository GitHub media credentials", () => {
   it.effect.each([
+    "https://example.test/image.png",
+    "https://github.com/user-attachments/assets/fake-id",
+    "https://raw.githubusercontent.com/OwnerB/Repo/main/image.png",
+  ])("strips bearer on redirect to %s without invalidating an unused credential", (target) => {
+    const authorizations: Array<string | undefined> = [];
+    let invalidations = 0;
+    return Effect.gen(function* () {
+      const response = yield* githubMediaResponse(
+        asset("https://raw.githubusercontent.com/OwnerA/Repo/main/image.png"),
+        {},
+      );
+      expect(response.status).toBe(403);
+      expect(authorizations).toEqual(["Bearer synthetic-a", undefined]);
+      expect(invalidations).toBe(0);
+    }).pipe(
+      Effect.provide(
+        Layer.mock(GitHubCredentials.GitHubCredentials)({
+          get: (host) =>
+            Effect.succeed({
+              host,
+              repository: "ownera/repo",
+              source: "git",
+              fingerprint: "synthetic",
+              token: Redacted.make("synthetic-a"),
+            }),
+          invalidate: () =>
+            Effect.sync(() => {
+              invalidations++;
+            }),
+        }),
+      ),
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make((request) => {
+          authorizations.push(request.headers.authorization);
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              new Response(
+                null,
+                authorizations.length === 1
+                  ? { status: 302, headers: { location: target } }
+                  : { status: 403 },
+              ),
+            ),
+          );
+        }),
+      ),
+      Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+      Effect.scoped,
+    );
+  });
+
+  it.effect.each(["http://example.test/file.png", "https://example.test/file.png"])(
+    "bounds redirects and refuses downgrade: %s",
+    (target) => {
+      let requests = 0;
+      return Effect.gen(function* () {
+        const response = yield* githubMediaResponse(
+          asset("https://github.com/user-attachments/assets/fake"),
+          {},
+        );
+        expect(response.status).toBe(502);
+        expect(requests).toBe(target.startsWith("http:") ? 1 : 4);
+      }).pipe(
+        Effect.provide(
+          Layer.mock(GitHubCredentials.GitHubCredentials)({
+            get: () =>
+              Effect.fail(new GitHubCredentials.GitHubNotSignedInError({ host: "github.com" })),
+          }),
+        ),
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) => {
+            requests++;
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                new Response(null, { status: 302, headers: { location: target } }),
+              ),
+            );
+          }),
+        ),
+        Effect.scoped,
+      );
+    },
+  );
+
+  it.effect.each(["image/svg+xml", "text/html"])(
+    "preserves content defenses for %s",
+    (contentType) =>
+      Effect.gen(function* () {
+        const response = yield* githubMediaResponse(
+          asset("https://github.com/user-attachments/assets/fake"),
+          { range: "bytes=0-9", authorization: "never-forward" },
+        );
+        expect(response.headers["x-content-type-options"]).toBe("nosniff");
+        expect(response.headers["set-cookie"]).toBeUndefined();
+        expect(response.status).toBe(contentType === "image/svg+xml" ? 200 : 415);
+        if (contentType === "image/svg+xml")
+          expect(response.headers["content-security-policy"]).toContain("sandbox");
+      }).pipe(
+        Effect.provide(
+          Layer.mock(GitHubCredentials.GitHubCredentials)({
+            get: () =>
+              Effect.fail(new GitHubCredentials.GitHubNotSignedInError({ host: "github.com" })),
+          }),
+        ),
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) => {
+            expect(request.headers.range).toBe("bytes=0-9");
+            expect(request.headers.authorization).toBeUndefined();
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                new Response("synthetic", {
+                  headers: { "content-type": contentType, "set-cookie": "never-forward" },
+                }),
+              ),
+            );
+          }),
+        ),
+        Effect.scoped,
+      ),
+  );
+  it.effect.each([
     { fallback: false, enabled: true, unsupportedPrefix: false },
     { fallback: true, enabled: true, unsupportedPrefix: false },
     { fallback: true, enabled: false, unsupportedPrefix: false },

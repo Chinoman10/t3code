@@ -128,7 +128,17 @@ const fetchFollowingRedirects = Effect.fn("GitHubMediaFetch.fetchFollowingRedire
       )
       .pipe(Effect.provideService(FetchHttpClient.RequestInit, MANUAL_REDIRECT));
     const location = response.headers.location;
-    if (response.status < 300 || response.status >= 400) return response;
+    if (response.status < 300 || response.status >= 400) {
+      if (
+        authorization !== null &&
+        credential?.operationRepository !== undefined &&
+        (response.status === 401 || response.status === 403)
+      ) {
+        const credentials = yield* GitHubCredentials.GitHubCredentials;
+        yield* credentials.invalidate("github.com", credential.repository);
+      }
+      return response;
+    }
     if (!location || hop >= MAX_REDIRECTS) return null;
     const next = new URL(location, target);
     if (next.protocol !== "https:") return null;
@@ -148,13 +158,6 @@ export const githubMediaResponse = Effect.fn("GitHubMediaFetch.githubMediaRespon
     if (value !== undefined) forwarded[name] = value;
   }
   const response = yield* fetchFollowingRedirects(asset.url, forwarded, credential);
-  if (
-    credential?.operationRepository !== undefined &&
-    (response?.status === 401 || response?.status === 403)
-  ) {
-    const credentials = yield* GitHubCredentials.GitHubCredentials;
-    yield* credentials.invalidate("github.com", credential.repository);
-  }
   const remainingSeconds = Math.floor((asset.expiresAt - (yield* Clock.currentTimeMillis)) / 1000);
   const headers: Record<string, string> = {
     "cache-control":

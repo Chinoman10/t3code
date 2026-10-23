@@ -15,6 +15,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   SourceControlProviderKind,
   VcsProcessTimeoutError,
+  VcsProcessSpawnError,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
@@ -43,6 +44,7 @@ const response = (path: string, token = "fake-token") =>
 function harness(
   options: {
     enabled?: boolean;
+    flag?: string | null;
     disabledHost?: boolean;
     fallback?: "settings" | "env" | "gh";
     cwd?: string;
@@ -83,7 +85,12 @@ function harness(
     Layer.provide(NodeCrypto.layer),
     Layer.provide(
       Layer.succeed(HostProcess.Environment, {
-        T3CODE_GITHUB_USE_GIT_CREDENTIALS: options.enabled === false ? "0" : "1",
+        ...(options.flag === null
+          ? {}
+          : {
+              T3CODE_GITHUB_USE_GIT_CREDENTIALS:
+                options.flag ?? (options.enabled === false ? "0" : "1"),
+            }),
         GH_TOKEN: options.fallback === "gh" ? "" : "env-token",
       }),
     ),
@@ -93,6 +100,73 @@ function harness(
 }
 
 describe("repository Git credentials", () => {
+  it.effect.each([null, "0", "true", "01", "2"])("requires the exact opt-in flag: %s", (flag) => {
+    const { layer, calls } = harness({ flag });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      expect((yield* credentials.get("github.com", "Owner/Repo")).source).toBe("settings");
+      expect(calls).toHaveLength(0);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("bounds the helper cache to 128 entries", () => {
+    const { layer, calls } = harness();
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      for (let index = 0; index < 129; index++)
+        yield* credentials.get("github.com", `Owner/Repo${index}`);
+      yield* credentials.get("github.com", "Owner/Repo128");
+      expect(calls).toHaveLength(129);
+      yield* credentials.get("github.com", "Owner/Repo0");
+      expect(calls).toHaveLength(130);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect.each([
+    response("owner/repo.git").replace("protocol=https\n", ""),
+    response("owner/repo.git").replace("host=github.com\n", ""),
+    response("owner/repo.git") + "\nextra=value\n",
+    response("owner/repo.git") + "=value\n",
+    response("owner/repo.git") + "malformed\n",
+    response("owner/repo.git", "fake secret"),
+    response("owner/repo.git", "fake\tsecret"),
+    response("owner/repo.git", "fake\x7fsecret"),
+    response("owner/repo.git", "fakeésecret"),
+    response("owner/repo.git", "fake\rsecret"),
+  ])("rejects malformed protocol records and non-printable passwords: %#", (answer) => {
+    const { layer } = harness({ run: () => Effect.succeed(output(answer)) });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const error = yield* credentials.get("github.com", "owner/repo").pipe(Effect.flip);
+      expect(error._tag).toBe("GitHubGitCredentialError");
+      expect(JSON.stringify(error)).not.toContain("fake");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect.each([
+    {
+      answer: response("owner/repo.git", "fake=a=b") + "extensible=value\n\n",
+      source: "git",
+      token: "fake=a=b",
+    },
+    { answer: response("owner/repo.git", ""), source: "settings", token: "settings-token" },
+    {
+      answer: response("owner/repo.git").replace("password=fake-token\n", ""),
+      source: "settings",
+      token: "settings-token",
+    },
+  ])(
+    "accepts extensible records/equals and empty password misses: %#",
+    ({ answer, source, token }) => {
+      const { layer } = harness({ run: () => Effect.succeed(output(answer)) });
+      return Effect.gen(function* () {
+        const credentials = yield* GitHubCredentials.GitHubCredentials;
+        const selected = yield* credentials.get("github.com", "owner/repo");
+        expect(selected.source).toBe(source);
+        expect(Redacted.value(selected.token)).toBe(token);
+      }).pipe(Effect.provide(layer));
+    },
+  );
   it.effect(
     "honors real global owner stores with useHttpPath=false and ignores repository helpers",
     () =>
@@ -729,6 +803,11 @@ describe("repository Git credentials", () => {
         "owner/repo/extra",
         "https://github.com/owner/repo",
         " owner/repo",
+        "owner/.",
+        "owner/repo\rpassword=secret",
+        "owner%2Fother/repo",
+        `${"a".repeat(40)}/repo`,
+        `owner/${"a".repeat(101)}`,
       ]) {
         expect((yield* credentials.get("github.com", repository).pipe(Effect.flip))._tag).toBe(
           "GitHubGitCredentialError",
@@ -755,6 +834,31 @@ describe("repository Git credentials", () => {
       expect(error._tag).toBe("GitHubGitCredentialError");
       expect(JSON.stringify(error)).not.toContain("fake-token");
       expect(calls).toHaveLength(1);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("redacts spawn failures without fallback or caching", () => {
+    const { layer, calls } = harness({
+      run: () =>
+        Effect.fail(
+          new VcsProcessSpawnError({
+            operation: "GitHubCredentials.git",
+            command: "git",
+            cwd: "/trusted-server",
+            argumentCount: 4,
+            cause: new Error("synthetic-secret-marker"),
+          }),
+        ),
+    });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const error = yield* credentials.get("github.com", "owner/repo").pipe(Effect.flip);
+        expect(error._tag).toBe("GitHubGitCredentialError");
+        expect(JSON.stringify(error)).not.toContain("synthetic-secret-marker");
+        expect(String(error)).not.toContain("synthetic-secret-marker");
+      }
+      expect(calls).toHaveLength(2);
     }).pipe(Effect.provide(layer));
   });
 
