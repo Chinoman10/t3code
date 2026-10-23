@@ -45,6 +45,7 @@ import * as BitbucketPullRequestProvider from "@t3tools/source-control-bitbucket
 import * as GitHubRest from "@t3tools/source-control-github/server/GitHubRest";
 import * as GitHubRequestPolicy from "@t3tools/source-control-github/server/GitHubRequestPolicy";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as GitHubCredentials from "@t3tools/source-control-github/server/GitHubCredentials";
 import * as GitHubPullRequestApi from "@t3tools/source-control-github/server/GitHubPullRequestApi";
 import * as GitHubPullRequestProvider from "@t3tools/source-control-github/server/GitHubPullRequestProvider";
@@ -1303,6 +1304,226 @@ it.effect("keeps opted-in repository viewers and list searches separate for one 
   }).pipe(
     Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
   ),
+);
+
+it.effect.each([
+  { involvement: "authored" as const, author: "me" },
+  { involvement: "authored" as const, author: "@me" },
+  { involvement: "all" as const, author: undefined },
+])(
+  "uses the read-time Settings principal for listing $involvement / $author after rotation",
+  ({ involvement, author }) =>
+    Effect.gen(function* () {
+      const requests: Array<{ path: string; bearer: string | undefined; query?: string }> = [];
+      let helperCalls = 0;
+      const stackBearers: Array<string | undefined> = [];
+      const host = TestSourceControlHost.layer({
+        settings: applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+          sourceControlHosts: { github: { tokens: { "github.com": "synthetic-A" } } },
+        }),
+        process: {
+          run: () => {
+            helperCalls++;
+            return Effect.succeed(
+              TestSourceControlHost.processOutput("", {
+                exitCode: ChildProcessSpawner.ExitCode(128),
+                stderr:
+                  "fatal: could not read Username for 'https://github.com/Owner/Repo.git': terminal prompts disabled\n",
+              }),
+            );
+          },
+        },
+      });
+      const http = Layer.effect(
+        HttpClient.HttpClient,
+        Effect.gen(function* () {
+          const settings = yield* TestSourceControlHost.TestSourceControlHostSettings;
+          return HttpClient.make((request) =>
+            Effect.gen(function* () {
+              const path = new URL(request.url).pathname;
+              const bearer = request.headers.authorization;
+              if (path === "/user") {
+                requests.push({ path, bearer });
+                const alice = bearer === "Bearer synthetic-A";
+                yield* settings.update({
+                  sourceControlHosts: { github: { tokens: { "github.com": "synthetic-B" } } },
+                });
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json({ id: alice ? 1 : 2, login: alice ? "Alice" : "Bob" }),
+                );
+              }
+              assert.strictEqual(path, "/graphql");
+              assert.strictEqual(request.body._tag, "Uint8Array");
+              if (request.body._tag !== "Uint8Array") return yield* Effect.die("Missing query");
+              const sent = JSON.parse(new TextDecoder().decode(request.body.body)) as {
+                operationName: string;
+                variables: { q: string };
+              };
+              if (sent.operationName === "PullRequestStackMembership") {
+                stackBearers.push(bearer);
+                return HttpClientResponse.fromWeb(request, Response.json({ data: {} }));
+              }
+              assert.strictEqual(sent.operationName, "PullRequestSearch");
+              requests.push({ path, bearer, query: sent.variables.q });
+              return HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  data: {
+                    search: {
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                      nodes: ["Bob", "Carol", "Alice"].map((login, index) => ({
+                        number: index + 1,
+                        title: `Pull request ${index + 1}`,
+                        url: `https://github.com/Owner/Repo/pull/${index + 1}`,
+                        repository: { nameWithOwner: "Owner/Repo" },
+                        author: {
+                          __typename: "User",
+                          login,
+                          name: null,
+                          avatarUrl: "https://avatars.example.test/synthetic",
+                        },
+                        state: "OPEN",
+                        isDraft: false,
+                        mergeable: "UNKNOWN",
+                        reviewDecision: null,
+                        latestReviews: { nodes: [] },
+                        mergedAt: null,
+                        headRefName: "feature",
+                        baseRefName: "main",
+                        createdAt: "2026-07-01T00:00:00Z",
+                        updatedAt: "2026-07-02T00:00:00Z",
+                        labels: { nodes: [] },
+                        commits: { nodes: [] },
+                        reviewRequests: {
+                          nodes: ["Alice", "Bob"].map((reviewer) => ({
+                            requestedReviewer: { __typename: "User", login: reviewer },
+                          })),
+                        },
+                      })),
+                    },
+                  },
+                }),
+              );
+            }),
+          );
+        }),
+      ).pipe(Layer.provide(host));
+      const apiContext = yield* Layer.build(
+        GitHubPullRequestApi.layer.pipe(
+          Layer.provideMerge(GitHubRest.layerWithDependencies),
+          Layer.provideMerge(host),
+          Layer.provideMerge(http),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provide(NodeCrypto.layer),
+        ),
+      );
+      const native = yield* GitHubPullRequestProvider.make.pipe(Effect.provideContext(apiContext));
+      const service = yield* makeService({
+        projects: [
+          project({ id: "p1", title: "A", workspaceRoot: "/a", repository: "Owner/Repo" }),
+        ],
+        providers: [native],
+      });
+      const input = {
+        state: "open" as const,
+        involvement,
+        query: "synthetic-rotation",
+        ...(author === undefined ? {} : { filters: { author } }),
+      };
+      const first = yield* service.list(input);
+      const next = yield* service.list(input);
+      assert.deepStrictEqual(requests.slice(0, 2), [
+        { path: "/user", bearer: "Bearer synthetic-A" },
+        { path: "/user", bearer: "Bearer synthetic-B" },
+      ]);
+      assert.strictEqual(requests.length, 4);
+      for (const request of requests.slice(2)) {
+        assert.strictEqual(request.bearer, "Bearer synthetic-B");
+        assert.include(request.query!, '"synthetic-rotation"');
+        assert.include(request.query!, "repo:Owner/Repo");
+        assert.notInclude(request.query!, "author:Alice");
+        if (involvement === "authored") assert.include(request.query!, "author:Bob");
+      }
+      for (const result of [first, next]) {
+        assert.deepStrictEqual(result.errors, []);
+        assert.deepStrictEqual(result.viewers, {
+          "github.com": "Bob",
+          "github.com owner/repo": "Bob",
+        });
+        assert.deepStrictEqual(
+          result.entries.map((entry) => [entry.author?.login, entry.viewerReviewRequested]),
+          author === undefined
+            ? [
+                ["Bob", false],
+                ["Carol", true],
+                ["Alice", true],
+              ]
+            : [["Bob", false]],
+        );
+      }
+      assert.strictEqual(helperCalls, 1);
+      assert.isNotEmpty(stackBearers);
+      assert.isTrue(stackBearers.every((bearer) => bearer === "Bearer synthetic-B"));
+    }).pipe(
+      Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+    ),
+);
+
+it.effect.each([false, true])(
+  "uses the first successful read-time repository viewer for the legacy host (first fails: %s)",
+  (firstFails) =>
+    Effect.gen(function* () {
+      const secondRead = yield* Deferred.make<void>();
+      const selections = new Map<string, number>();
+      const service = yield* makeService({
+        projects: [
+          project({ id: "p1", title: "A", workspaceRoot: "/a", repository: "OwnerA/Repo" }),
+          project({ id: "p2", title: "B", workspaceRoot: "/b", repository: "OwnerB/Repo" }),
+        ],
+        providers: [
+          fakeProvider(SourceControlProviderKind.make("github"), {
+            withVerifiedCredential: (input, use) =>
+              Effect.suspend(() => {
+                assert.isDefined(input.repository);
+                const count = selections.get(input.repository!) ?? 0;
+                selections.set(input.repository!, count + 1);
+                const viewer =
+                  input.repository === "OwnerA/Repo"
+                    ? count === 0
+                      ? "Alice"
+                      : "Bob"
+                    : count === 0
+                      ? "Carol"
+                      : "Dave";
+                return use({ accountId: viewer, viewer, credentialFingerprint: `pat:${viewer}` });
+              }),
+            listChangeRequests: (input) =>
+              Effect.gen(function* () {
+                if (input.repository === "OwnerA/Repo") {
+                  yield* Deferred.await(secondRead);
+                  assert.strictEqual(input.viewer, "Bob");
+                  if (firstFails) return yield* requestFailed;
+                } else {
+                  assert.strictEqual(input.viewer, "Dave");
+                  yield* Deferred.succeed(secondRead, undefined);
+                }
+                return { items: [], truncated: false, continues: false };
+              }),
+          }),
+        ],
+      });
+      const result = yield* service.list({ state: "open" });
+      assert.deepStrictEqual(result.viewers, {
+        "github.com": firstFails ? "Dave" : "Bob",
+        "github.com ownera/repo": firstFails ? "Alice" : "Bob",
+        "github.com ownerb/repo": "Dave",
+      });
+      assert.strictEqual(result.errors.length, firstFails ? 1 : 0);
+      assert.deepStrictEqual([...selections.values()], [2, 2]);
+    }).pipe(
+      Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+    ),
 );
 
 it.effect.each([true, false])(

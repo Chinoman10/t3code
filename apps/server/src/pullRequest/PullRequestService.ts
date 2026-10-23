@@ -335,6 +335,7 @@ interface WorkspaceProjects {
 
 interface RepositoryBatch {
   readonly key: string;
+  readonly viewer?: { readonly host: string; readonly login: string };
   readonly entries: ReadonlyArray<PullRequestListEntry>;
   readonly errors: ReadonlyArray<PullRequestListProjectError>;
   readonly truncated: boolean;
@@ -1279,35 +1280,35 @@ export const make = Effect.gen(function* () {
 
     const readRepository = (project: SupportedProject): Effect.Effect<RepositoryBatch> => {
       {
-        const viewer = projectViewer(project, viewerResults)!.viewer!;
         const key = project.cursorKey;
         const cursor = cursorOf(project);
         return withProjectCredential(
           project,
-          project.api.listChangeRequests({
-            cwd: project.project.workspaceRoot,
-            repository: providerRepository(project),
-            host: project.host,
-            state: input.state,
-            involvement,
-            viewer,
-            limit,
-            query: input.query,
-            filters: input.filters,
-            ...(cursor === undefined
-              ? {}
-              : {
-                  cursor: {
-                    updatedBefore: cursor.updatedBefore,
-                    delivered: cursor.delivered,
-                    seenAt: cursor.seenAt,
-                  },
-                }),
-          }),
-          false,
-        ).pipe(
-          observeRead,
-          Effect.map(({ value: page, observedAt }): RepositoryBatch => {
+          Effect.gen(function* () {
+            const credential = yield* routingCredential;
+            const viewer = credential?.viewer ?? projectViewer(project, viewerResults)!.viewer!;
+            const { value: page, observedAt } = yield* project.api
+              .listChangeRequests({
+                cwd: project.project.workspaceRoot,
+                repository: providerRepository(project),
+                host: project.host,
+                state: input.state,
+                involvement,
+                viewer,
+                limit,
+                query: input.query,
+                filters: input.filters,
+                ...(cursor === undefined
+                  ? {}
+                  : {
+                      cursor: {
+                        updatedBefore: cursor.updatedBefore,
+                        delivered: cursor.delivered,
+                        seenAt: cursor.seenAt,
+                      },
+                    }),
+              })
+              .pipe(observeRead);
             // The boundary instant was asked for inclusively, so the rows already sent at it
             // come back with the slice. Dropping them here rather than asking for strictly
             // older is what keeps their neighbours at the same instant from being skipped.
@@ -1321,6 +1322,7 @@ export const make = Effect.gen(function* () {
                   );
             return {
               key,
+              ...(credential === null ? {} : { viewer: { host: project.host, login: viewer } }),
               entries: items
                 .filter((item) => matchesRowFilters(item, input.filters, viewer))
                 .map((item) => toEntry({ project, item, viewer, observedAt })),
@@ -1332,6 +1334,8 @@ export const make = Effect.gen(function* () {
                   : null,
             };
           }),
+          false,
+        ).pipe(
           Effect.orElseSucceed((): RepositoryBatch => ({
             key,
             entries: [],
@@ -1470,8 +1474,18 @@ export const make = Effect.gen(function* () {
     const batches = (yield* Effect.all(reads, { concurrency: REPOSITORY_CONCURRENCY })).flat();
 
     const nextCursors: Record<string, string> = {};
+    const readViewerHosts = new Set<string>();
     for (const batch of batches) {
       if (batch.nextCursor !== null) nextCursors[batch.key] = batch.nextCursor;
+      if (batch.viewer !== undefined) {
+        const { host, login } = batch.viewer;
+        viewers[batch.key] = login;
+        // Keep the first successful repository's principal as the legacy host fallback.
+        if (!readViewerHosts.has(host)) {
+          viewers[host] = login;
+          readViewerHosts.add(host);
+        }
+      }
     }
 
     return {
