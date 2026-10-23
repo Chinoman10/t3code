@@ -1095,7 +1095,28 @@ export const make = Effect.gen(function* () {
         return repositoryCloneUrls(decoded.success);
       },
       (effect, input) =>
-        effect.pipe(
+        Effect.gen(function* () {
+          if (environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS !== "1") return yield* effect;
+          const locator = parseGitHubRepositorySelector(
+            input.repository,
+            (environment.GH_HOST ?? "github.com").toLowerCase(),
+          );
+          if (locator === null || locator.host !== "github.com") return yield* effect;
+          const credential = yield* api
+            .credential(locator.host, `${locator.owner}/${locator.name}`)
+            .pipe(Effect.mapError(fromGitHubApiError));
+          return yield* effect.pipe(
+            Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
+              host: locator.host,
+              token: credential.token,
+              credentialFingerprint: credential.fingerprint,
+              ...(credential.repository === undefined ? {} : { repository: credential.repository }),
+              ...(credential.credentialRepository === undefined
+                ? {}
+                : { credentialRepository: credential.credentialRepository }),
+            }),
+          );
+        }).pipe(
           Effect.mapError(
             providerError("createRepository", input.cwd, { repository: input.repository }),
           ),

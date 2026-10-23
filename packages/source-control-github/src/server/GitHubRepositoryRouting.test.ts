@@ -467,6 +467,103 @@ describe("native GitHub repository routing", () => {
     },
   );
 
+  it.effect("pins create-owner identity and creation across a Settings token rotation", () => {
+    const requests: HttpClientRequest.HttpClientRequest[] = [];
+    const helperPaths: string[] = [];
+    const host = TestSourceControlHost.layer({
+      settings: applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+        sourceControlHosts: { github: { tokens: { "github.com": "synthetic-A" } } },
+      }),
+      process: {
+        run: (input) =>
+          Effect.sync(() => {
+            expect(input.command).toBe("git");
+            helperPaths.push(/path=(.*)\n/.exec(input.stdin ?? "")?.[1] ?? "");
+            return {
+              exitCode: ChildProcessSpawner.ExitCode(128),
+              stdout: "",
+              stderr:
+                "fatal: could not read Username for 'https://github.com/Alice/NewRepo.git': terminal prompts disabled\n",
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            };
+          }),
+      },
+    });
+    const http = Layer.effect(
+      HttpClient.HttpClient,
+      Effect.gen(function* () {
+        const settings = yield* TestSourceControlHost.TestSourceControlHostSettings;
+        return HttpClient.make((request) =>
+          Effect.gen(function* () {
+            requests.push(request);
+            const owner = request.headers.authorization === "Bearer synthetic-A" ? "Alice" : "Bob";
+            const isViewer = new URL(request.url).pathname === "/user";
+            if (isViewer) {
+              yield* settings.update({
+                sourceControlHosts: { github: { tokens: { "github.com": "synthetic-B" } } },
+              });
+            }
+            const body = isViewer
+              ? { id: owner === "Alice" ? 1 : 2, login: owner }
+              : {
+                  full_name: `${owner}/NewRepo`,
+                  html_url: `https://github.com/${owner}/NewRepo`,
+                  ssh_url: `git@github.com:${owner}/NewRepo.git`,
+                };
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(JSON.stringify(body), {
+                headers: { "content-type": "application/json" },
+              }),
+            );
+          }),
+        );
+      }),
+    ).pipe(Layer.provide(host));
+    const layer = GitHubApi.layerWithDependencies.pipe(
+      Layer.provideMerge(http),
+      Layer.provideMerge(host),
+      Layer.provide(NodeCrypto.layer),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provide(
+        Layer.succeed(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+      ),
+      Layer.provide(Layer.succeed(HostProcess.WorkingDirectory, "/trusted")),
+    );
+    return Effect.gen(function* () {
+      const provider = yield* GitHubSourceControlProvider.make;
+      const input = { cwd: "/synthetic-checkout", visibility: "private" as const };
+      const first = yield* provider.createRepository({ ...input, repository: "Alice/NewRepo" });
+      expect(requests.map((request) => request.headers.authorization)).toEqual([
+        "Bearer synthetic-A",
+        "Bearer synthetic-A",
+      ]);
+      expect(first).toEqual({
+        nameWithOwner: "Alice/NewRepo",
+        url: "https://github.com/Alice/NewRepo",
+        sshUrl: "git@github.com:Alice/NewRepo.git",
+      });
+      const api = yield* GitHubApi.GitHubRest;
+      yield* api.rest({
+        host: "github.com",
+        repository: "Alice/NewRepo",
+        operation: "getViewer",
+        path: "user",
+      });
+      expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+        "/user",
+        "/user/repos",
+        "/user",
+      ]);
+      expect(requests[2]?.headers.authorization).toBe("Bearer synthetic-B");
+      expect(helperPaths).toEqual(["Alice/NewRepo.git"]);
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provideService(HostProcess.Environment, { T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1" }),
+    );
+  });
+
   it.effect("routes repository lookup before cloning for shorthand and full URLs", () => {
     const { layer, requests, helperPaths } = harness();
     return Effect.gen(function* () {
