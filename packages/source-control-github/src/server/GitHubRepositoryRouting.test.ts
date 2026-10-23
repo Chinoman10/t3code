@@ -438,6 +438,85 @@ describe("native GitHub repository routing", () => {
     },
   );
 
+  it.effect.each(
+    ["Settings", "GH_TOKEN", "GITHUB_TOKEN"].flatMap((source) =>
+      ["refusal", "request failure"].map((failure) => ({ source, failure })),
+    ),
+  )(
+    "preserves $source $failure diagnostics in repository discovery fallback",
+    ({ source, failure }) => {
+      const savedToken = source === "Settings";
+      const diagnostic =
+        failure === "refusal"
+          ? savedToken
+            ? "GitHub refused the token saved in Settings. Replace or remove it in Settings → Source Control."
+            : `GitHub refused the token in ${source}. Replace it, or unset it to use \`gh auth login\`.`
+          : `Could not check ${savedToken ? "the token saved in Settings" : `the token in ${source}`}: Could not reach GitHub at github.com.`;
+      let requests = 0;
+      return Effect.gen(function* () {
+        const discovery = yield* GitHubSourceControlProvider.makeDiscovery;
+        const available = yield* discovery.probe("/untrusted-checkout");
+        expect(available.status).toBe("available");
+        expect(available.auth.status).toBe("unknown");
+        expect(Option.isNone(available.auth.account)).toBe(true);
+        expect(Option.getOrNull(available.auth.host)).toBe("github.com");
+        expect(Option.getOrNull(available.auth.detail)).toBe(
+          `${diagnostic} Git credentials are resolved per repository. Enter an owner/repository or GitHub URL; host-wide operations still need a default GitHub credential.`,
+        );
+        expect(requests).toBe(1);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.mock(GitHubApi.GitHubRest)({
+              rest: (input) => {
+                expect(input).toEqual({ host: "github.com", operation: "discovery", path: "user" });
+                requests++;
+                return Effect.fail(
+                  failure === "refusal"
+                    ? new GitHubRequestPolicy.GitHubApiAuthenticationError({
+                        host: "github.com",
+                        operation: "discovery",
+                      })
+                    : new GitHubRequestPolicy.GitHubApiRequestError({
+                        host: "github.com",
+                        operation: "discovery",
+                        cause: "synthetic offline",
+                      }),
+                );
+              },
+            }),
+            TestSourceControlHost.layer({
+              settings: applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+                sourceControlHosts: {
+                  github: { tokens: savedToken ? { "github.com": "synthetic-token" } : {} },
+                },
+              }),
+              process: {
+                run: (input) => {
+                  if (input.command === "git") {
+                    expect(input.args).toEqual(["--version"]);
+                    expect(input.cwd).toBe("/trusted");
+                  }
+                  return Effect.succeed(
+                    TestSourceControlHost.processOutput(
+                      input.command === "git" ? "git version 2.43.0\n" : "",
+                      { exitCode: ChildProcessSpawner.ExitCode(input.command === "git" ? 0 : 1) },
+                    ),
+                  );
+                },
+              },
+            }),
+          ),
+        ),
+        Effect.provideService(HostProcess.Environment, {
+          T3CODE_GITHUB_USE_GIT_CREDENTIALS: "1",
+          ...(savedToken ? {} : { [source]: "synthetic-token" }),
+        }),
+        Effect.provideService(HostProcess.WorkingDirectory, "/trusted"),
+      );
+    },
+  );
+
   it.effect(
     "keeps create-owner identity and repository creation on the explicit repository credential",
     () => {

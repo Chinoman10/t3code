@@ -270,8 +270,12 @@ export const makeDiscovery = Effect.gen(function* () {
                 auth: providerAuth({
                   status: "unknown",
                   host: "github.com",
-                  detail:
+                  detail: [
+                    Option.getOrUndefined(item.auth.detail),
                     "Git credentials are resolved per repository. Enter an owner/repository or GitHub URL; host-wide operations still need a default GitHub credential.",
+                  ]
+                    .filter(Boolean)
+                    .join(" "),
                 }),
               }
             : item;
