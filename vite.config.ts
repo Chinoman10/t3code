@@ -355,6 +355,66 @@ export default defineConfig({
         rules: { "eslint/no-restricted-imports": ["error", { paths: RESTRICTED_IMPORT_PATHS }] },
       },
       {
+        // The server and every client load a forge's shared definition, so a UI runtime
+        // imported there would break the server; client-only forge code goes in `src/client/`.
+        files: ["packages/source-control-*/src/shared/**"],
+        rules: {
+          "eslint/no-restricted-imports": [
+            "error",
+            {
+              paths: [...RESTRICTED_IMPORT_PATHS, RESTRICTED_PULL_REQUEST_GLYPH_IMPORTS],
+              patterns: [
+                {
+                  group: [
+                    "react",
+                    "react/*",
+                    "react-*",
+                    "expo",
+                    "expo-*",
+                    "lucide-react",
+                    "@t3tools/client-runtime",
+                    "@t3tools/client-runtime/*",
+                    "../client/*",
+                    "../server/*",
+                    "../../client/*",
+                    "../../server/*",
+                    "../../../client/*",
+                    "../../../server/*",
+                    "@t3tools/source-control-*/client/*",
+                    "@t3tools/source-control-*/server/*",
+                  ],
+                  message:
+                    "Shared forge definitions load on the server and every client; keep UI and server code out.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        files: ["apps/server/src/**", "packages/source-control-*/src/server/**"],
+        rules: {
+          "eslint/no-restricted-imports": [
+            "error",
+            {
+              paths: [...RESTRICTED_IMPORT_PATHS, RESTRICTED_PULL_REQUEST_GLYPH_IMPORTS],
+              patterns: [
+                {
+                  group: [
+                    "@t3tools/source-control-*/client/*",
+                    "../client/*",
+                    "../../client/*",
+                    "../../../client/*",
+                  ],
+                  message:
+                    "A forge's client entry is UI-only; the server reads its `shared/definition`.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
         files: ["apps/mobile/src/**"],
         rules: { "t3code/no-mobile-uniwind-theme-escape-hatches": "error" },
       },
@@ -537,6 +597,7 @@ export default defineConfig({
           "apps/mobile/src/native/T3ComposerEditor.ios.tsx",
           "apps/mobile/src/native/T3ComposerEditor.native.tsx",
           "apps/mobile/src/native/SelectableMarkdownText.tsx",
+          "apps/mobile/src/native/useEnrichedLinkVariants.ts",
         ],
         rules: {
           "t3code/no-mobile-uniwind-theme-escape-hatches": ["error", { allowUniwindTheme: true }],

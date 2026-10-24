@@ -13,6 +13,7 @@ import { DEFAULT_SERVER_SETTINGS, SourceControlProviderKind } from "@t3tools/con
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "./GitHubRest.ts";
 import * as GitHubPullRequestApi from "./GitHubPullRequestApi.ts";
 import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
@@ -30,6 +31,7 @@ function harness(
   } = {},
 ) {
   const requests: HttpClientRequest.HttpClientRequest[] = [];
+  const pins: Array<string | undefined> = [];
   const helperPaths: string[] = [];
   const refused = new Set<string>();
   let generation = 1;
@@ -40,37 +42,40 @@ function harness(
     });
   const http = Layer.succeed(
     HttpClient.HttpClient,
-    HttpClient.make((request) => {
-      requests.push(request);
-      const token = request.headers.authorization ?? "";
-      const pathname = new URL(request.url).pathname;
-      const result = refused.has(token)
-        ? json(
-            { message: options.rateLimited ? "API rate limit exceeded" : "Bad credentials" },
-            refusalStatus,
-          )
-        : pathname === "/user"
-          ? json({ id: 123, login: "Chinoman10" })
-          : pathname.startsWith("/repos/")
-            ? json({
-                full_name: pathname.slice("/repos/".length),
-                html_url: `https://github.com/${pathname.slice(7)}`,
-                ssh_url: `git@github.com:${pathname.slice(7)}.git`,
-              })
-            : successfulGraphql
+    HttpClient.make((request) =>
+      Effect.flatMap(GitHubRequestPolicy.PinnedGitHubCredential, (pin) => {
+        pins.push(pin?.repository);
+        requests.push(request);
+        const token = request.headers.authorization ?? "";
+        const pathname = new URL(request.url).pathname;
+        const result = refused.has(token)
+          ? json(
+              { message: options.rateLimited ? "API rate limit exceeded" : "Bad credentials" },
+              refusalStatus,
+            )
+          : pathname === "/user"
+            ? json({ id: 123, login: "Chinoman10" })
+            : pathname.startsWith("/repos/")
               ? json({
-                  data: {
-                    repository: { pullRequest: { id: "PR_1" }, pullRequests: { nodes: [] } },
-                    addComment: { clientMutationId: null },
-                    addReaction: { reaction: { content: "THUMBS_UP" } },
-                    _0_markFileAsViewed: { clientMutationId: null },
-                    _1_unmarkFileAsViewed: { clientMutationId: null },
-                    _0_repository: { pullRequests: { nodes: [] } },
-                  },
+                  full_name: pathname.slice("/repos/".length),
+                  html_url: `https://github.com/${pathname.slice(7)}`,
+                  ssh_url: `git@github.com:${pathname.slice(7)}.git`,
                 })
-              : json({ message: "Not Found" }, 404);
-      return Effect.succeed(HttpClientResponse.fromWeb(request, result));
-    }),
+              : successfulGraphql
+                ? json({
+                    data: {
+                      repository: { pullRequest: { id: "PR_1" }, pullRequests: { nodes: [] } },
+                      addComment: { clientMutationId: null },
+                      addReaction: { reaction: { content: "THUMBS_UP" } },
+                      _0_markFileAsViewed: { clientMutationId: null },
+                      _1_unmarkFileAsViewed: { clientMutationId: null },
+                      _0_repository: { pullRequests: { nodes: [] } },
+                    },
+                  })
+                : json({ message: "Not Found" }, 404);
+        return Effect.succeed(HttpClientResponse.fromWeb(request, result));
+      }),
+    ),
   );
   const host = TestSourceControlHost.layer({
     settings: applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
@@ -110,6 +115,7 @@ function harness(
     },
   });
   const api = GitHubApi.layerWithDependencies.pipe(
+    Layer.provideMerge(SourceControlRateLimit.layer),
     Layer.provideMerge(host),
     Layer.provideMerge(http),
     Layer.provide(NodeCrypto.layer),
@@ -125,6 +131,7 @@ function harness(
   return {
     layer,
     requests,
+    pins,
     helperPaths,
     refused,
     rotate: () => {
@@ -134,6 +141,44 @@ function harness(
 }
 
 describe("native GitHub repository routing", () => {
+  it.effect("pins new label and author option APIs without extra identity probes", () => {
+    const { layer, requests, pins, helperPaths } = harness();
+    return Effect.gen(function* () {
+      const api = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      for (const kind of ["labels", "authors"]) {
+        for (const repository of ["OwnerA/Repo", "OwnerB/Repo"]) {
+          const input = { cwd: "/w", host: "github.com", repository, query: "needle" };
+          const read =
+            kind === "labels"
+              ? api.listRepositoryLabels(input).pipe(Effect.asVoid)
+              : api.searchRepositoryAuthors(input).pipe(Effect.asVoid);
+          const error = yield* read.pipe(Effect.flip);
+          expect(error._tag).toBe("GitHubApiNotFoundError");
+        }
+      }
+      expect(pins).toEqual(["ownera/repo", "ownerb/repo", "ownera/repo", "ownerb/repo"]);
+      expect(helperPaths).toEqual(["OwnerA/Repo.git", "OwnerB/Repo.git"]);
+      expect(requests.map((request) => new URL(request.url).pathname)).toEqual(
+        Array(4).fill("/graphql"),
+      );
+      expect(requests.map((request) => request.headers.authorization)).toEqual([
+        "Bearer fake-OwnerA-1",
+        "Bearer fake-OwnerB-1",
+        "Bearer fake-OwnerA-1",
+        "Bearer fake-OwnerB-1",
+      ]);
+      for (const [index, request] of requests.entries()) {
+        expect(request.body._tag).toBe("Uint8Array");
+        if (request.body._tag !== "Uint8Array") return yield* Effect.die("Missing query");
+        expect(JSON.parse(new TextDecoder().decode(request.body.body)).variables).toEqual({
+          owner: index % 2 === 0 ? "OwnerA" : "OwnerB",
+          name: "Repo",
+          query: "needle",
+        });
+      }
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("forwards the repository to every conditional checks endpoint", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
@@ -601,6 +646,7 @@ describe("native GitHub repository routing", () => {
       }),
     ).pipe(Layer.provide(host));
     const layer = GitHubApi.layerWithDependencies.pipe(
+      Layer.provideMerge(SourceControlRateLimit.layer),
       Layer.provideMerge(http),
       Layer.provideMerge(host),
       Layer.provide(NodeCrypto.layer),

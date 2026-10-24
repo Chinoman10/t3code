@@ -37,6 +37,7 @@ import {
   type PullRequestReviewVerdict,
   type PullRequestReviewerCandidateList,
   type PullRequestReviewerKind,
+  type PullRequestLabel,
   type PullRequestLabelCandidateList,
   type PullRequestThreadCommentsResult,
   type PullRequestUpdateMethod,
@@ -69,6 +70,8 @@ import {
   pullRequestLookup,
   toActorAvatars,
   toLabelCandidates,
+  toRepositoryAuthors,
+  toRepositoryLabels,
   toPullRequestActivityPage,
   toPullRequestCheckContextsPage,
   toPullRequestCore,
@@ -652,6 +655,26 @@ export class GitHubPullRequestApi extends Context.Service<
       readonly host: string;
       readonly number: number;
     }) => Effect.Effect<PullRequestLabelCandidateList, GitHubPullRequestApiError>;
+
+    readonly listRepositoryLabels: (input: {
+      readonly cwd: string;
+      readonly repository: string;
+      readonly host: string;
+      readonly query?: string | undefined;
+    }) => Effect.Effect<
+      { readonly items: ReadonlyArray<PullRequestLabel>; readonly truncated: boolean },
+      GitHubPullRequestApiError
+    >;
+
+    readonly searchRepositoryAuthors: (input: {
+      readonly cwd: string;
+      readonly repository: string;
+      readonly host: string;
+      readonly query?: string | undefined;
+    }) => Effect.Effect<
+      { readonly items: ReadonlyArray<PullRequestActor>; readonly truncated: boolean },
+      GitHubPullRequestApiError
+    >;
 
     readonly setLabels: (input: {
       readonly cwd: string;
@@ -2495,6 +2518,30 @@ export const make = Effect.gen(function* () {
         );
     },
 
+    listRepositoryLabels: (input) => {
+      const { owner, name } = parseRepositorySelector(input.repository);
+      const operation = "listRepositoryLabels";
+      return client
+        .RepositoryLabels({ owner, name, query: input.query ?? null })
+        .pipe(
+          graphql({ ...input, operation, allowReserve: true }),
+          Effect.map(toRepositoryLabels),
+          Effect.flatMap(found({ ...input, operation })),
+        );
+    },
+
+    searchRepositoryAuthors: (input) => {
+      const { owner, name } = parseRepositorySelector(input.repository);
+      const operation = "searchRepositoryAuthors";
+      return client
+        .RepositoryAuthors({ owner, name, query: input.query ?? null })
+        .pipe(
+          graphql({ ...input, operation, allowReserve: true }),
+          Effect.map(toRepositoryAuthors),
+          Effect.flatMap(found({ ...input, operation })),
+        );
+    },
+
     setLabels: (input) => {
       const { owner, name } = parseRepositorySelector(input.repository);
       const issue = `repos/${owner}/${name}/issues/${input.number}/labels`;
@@ -3019,6 +3066,10 @@ export const make = Effect.gen(function* () {
       withRepositoryCredential(input, service.setReviewerRequest(input)),
     listLabelCandidates: (input) =>
       withRepositoryCredential(input, service.listLabelCandidates(input)),
+    listRepositoryLabels: (input) =>
+      withRepositoryCredential(input, service.listRepositoryLabels(input)),
+    searchRepositoryAuthors: (input) =>
+      withRepositoryCredential(input, service.searchRepositoryAuthors(input)),
     setLabels: (input) => withRepositoryCredential(input, service.setLabels(input)),
     runPullRequestAction: (input) =>
       withRepositoryCredential(input, service.runPullRequestAction(input)),
