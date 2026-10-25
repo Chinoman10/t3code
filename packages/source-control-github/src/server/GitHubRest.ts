@@ -21,7 +21,7 @@ export interface GitHubRestResponse {
   readonly headers: Readonly<Record<string, string | undefined>>;
   readonly body: string;
   readonly truncated: boolean;
-  /** The body was not valid UTF-8, which a raw file read takes to mean binary. */
+  /** Invalid UTF-8 indicates a binary raw file. */
   readonly invalidUtf8: boolean;
 }
 
@@ -30,12 +30,12 @@ export interface GitHubRestInput {
   readonly repository?: string | undefined;
   readonly operation: string;
   readonly method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
-  /** Relative to the API root, e.g. `repos/acme/web/pulls/7`; query string included. */
+  /** Relative to the API root, including query string. */
   readonly path: string;
   readonly body?: unknown;
   /** Defaults to `application/vnd.github+json`. */
   readonly accept?: string;
-  /** Revalidates a cached answer. A 304 is returned rather than failed, and is free. */
+  /** Revalidate cached answers; 304 returns successfully without spending quota. */
   readonly ifNoneMatch?: string;
   readonly maxResponseBytes?: number;
   /** Defaults to 30 seconds; a whole pull request's patch may need longer. */
@@ -48,12 +48,10 @@ export class GitHubRest extends Context.Service<
   GitHubRest,
   {
     readonly rest: (input: GitHubRestInput) => Effect.Effect<GitHubRestResponse, GitHubApiError>;
-    /** The credential a request to `host` would carry right now. */
     readonly credential: GitHubRequestPolicy.GitHubRequestPolicy["Service"]["credential"];
   }
 >()("@t3tools/source-control-github/server/GitHubRest") {}
 
-/** A REST failure body: `{ message, errors: [{ message } | { resource, field, code }] }`. */
 const decodeRestErrors = Schema.decodeUnknownOption(
   Schema.fromJsonString(
     Schema.Struct({
@@ -93,7 +91,7 @@ function restErrorMessages(body: string): ReadonlyArray<string> | undefined {
   });
 }
 
-/** What a REST answer means: a 304 is an answer only when the request revalidated a cached one. */
+/** Accept 304 only for cache revalidation. */
 function classify(input: {
   readonly answer: GitHubRestResponse;
   readonly acceptNotModified: boolean;
@@ -111,15 +109,11 @@ function classify(input: {
   return { _tag: "Failed", messages: restErrorMessages(body), ...meta };
 }
 
-/** @public Service construction is part of the canonical Effect module API. */
+/** @public */
 export const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const policy = yield* GitHubRequestPolicy.GitHubRequestPolicy;
 
-  /**
-   * Sends one request through the request policy and fails a refusal with the error that says
-   * why. The answer is returned only once it is known to be one.
-   */
   const send = Effect.fn("GitHubRest.send")(function* (input: {
     readonly host: string;
     readonly repository?: string | undefined;
@@ -131,7 +125,7 @@ export const make = Effect.gen(function* () {
     readonly acceptNotModified: boolean;
   }) {
     const host = normalizeHost(input.host);
-    // Only the path: a query string can carry a SHA or a branch, and never needs to be in a trace.
+    // Query strings can expose SHAs or branches in traces.
     yield* Effect.annotateCurrentSpan({
       "github.kind": "rest",
       "http.request.method": input.request.method,
@@ -142,8 +136,7 @@ export const make = Effect.gen(function* () {
         host,
         repository: input.repository,
         operation: input.operation,
-        // Every REST path this reads today spends `core`; a `search/` read would need its own
-        // resource here.
+        // All current paths spend `core`; search would need a different resource.
         resource: "core",
         allowReserve: input.allowReserve,
         timeout: input.timeout,
@@ -153,15 +146,13 @@ export const make = Effect.gen(function* () {
           const response: HttpClientResponse.HttpClientResponse = yield* httpClient
             .execute(input.request.pipe(HttpClientRequest.setHeaders(headers)))
             .pipe(
-              // `GitHubRest.send` is the request's span. The client's own span would add
-              // `url.full` and `url.query`, which can carry SHAs and branch names, so it is off.
+              // Client spans expose SHAs and branches through url.full/url.query.
               Effect.provideService(HttpClient.TracerDisabledWhen, () => true),
             );
           const collected = yield* collectUint8StreamText({
             stream: response.stream,
             maxBytes: input.maxResponseBytes,
           }).pipe(
-            // 204, 304 and many refusals carry no body at all, which is an empty answer.
             Effect.catchIf(
               (error) => error.reason._tag === "EmptyBodyError",
               () => Effect.succeed({ text: "", truncated: false, invalidUtf8: false }),
@@ -221,10 +212,6 @@ export const make = Effect.gen(function* () {
   return GitHubRest.of({ rest, credential: policy.credential });
 });
 
-/**
- * The REST transport together with the request policy it sends through. The generated GraphQL
- * client sends through the same policy, so REST and GraphQL share one set of request slots.
- */
 export const layer = Layer.effect(GitHubRest, make).pipe(
   Layer.provideMerge(GitHubRequestPolicy.layer),
 );

@@ -1,4 +1,5 @@
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
+import { createInboxReturnTracker } from "@t3tools/client-runtime/state/thread-inbox";
 import { presentThreadShell } from "@t3tools/client-runtime/state/models";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -24,7 +25,7 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import type { PendingNewTask } from "../../state/use-pending-new-tasks";
 import { makeRawThreadShell, makeThreadShellFixture } from "../../test-fixtures";
@@ -100,12 +101,25 @@ describe("resolveThreadListV2Status", () => {
     );
   });
 
+  it("shows a waiting guest message as Request, after the agent's own requests", () => {
+    const thread = presentThreadShell(
+      environmentId,
+      decodeThreadShell(makeRawThreadShell({ status: "running" })),
+    );
+    const guest = { ...thread, pendingGuestMessageCount: 1 };
+
+    expect(resolveThreadListV2Status(guest)).toBe("request");
+    expect(resolveThreadListV2Status({ ...guest, hasPendingUserInput: true })).toBe("input");
+    expect(resolveThreadListV2Status({ ...guest, hasPendingApprovals: true })).toBe("approval");
+  });
+
   it.each([
-    { kind: "command", status: "ready" },
-    { kind: "monitor", status: "waiting" },
+    { roster: "dev server", task: { kind: "command" }, status: "ready" },
+    { roster: "dev server watchdog", task: { kind: "monitor" }, status: "ready" },
+    { roster: "awaited command", task: { kind: "command", awaited: true }, status: "waiting" },
   ] as const)(
-    "presents an unseen completion with a $kind roster as $status",
-    ({ kind, status }) => {
+    "presents an unseen completion with a $roster roster as $status",
+    ({ task, status }) => {
       const thread = presentThreadShell(
         environmentId,
         makeRawThreadShell({
@@ -113,7 +127,7 @@ describe("resolveThreadListV2Status", () => {
           status: "completed",
           latestRunCompletedAt: DateTime.makeUnsafe(NOW),
           lastVisitedAt: DateTime.makeUnsafe("2026-06-01T23:59:00.000Z"),
-          pendingBackgroundTasks: [{ taskId: "background-work", kind }],
+          pendingBackgroundTasks: [{ taskId: "background-work", ...task }],
         }),
       );
 
@@ -1547,6 +1561,34 @@ describe("Working section beta", () => {
     const off = build({ workingShelfEnabled: false });
     expect(ids(off)).toContain("working");
     expect(off.workingCount).toBe(0);
+  });
+
+  it("keeps an inactive row in Working during the shared grace and returns it on expiry", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+    const tracker = createInboxReturnTracker();
+    const working = makeThread({ id: ThreadId.make("grace"), title: "grace", runtime: running });
+    const inactive = { ...working, runtime: null };
+    const render = () =>
+      build({
+        threads: [inactive],
+        workingShelfExpanded: true,
+        isWorking: tracker.isWorking,
+        inboxReturnAt: tracker.returnedAt,
+      });
+    try {
+      tracker.observe([working]);
+      tracker.observe([inactive]);
+      expect(render().workingCount).toBe(1);
+      expect(render().items[0]?.thread.runtime).toBeNull();
+      vi.advanceTimersByTime(2_000);
+      expect(render().workingCount).toBe(0);
+      expect(ids(render())).toEqual(["grace"]);
+      expect(tracker.returnedAt(inactive)).toBe(Date.parse(NOW) + 2_000);
+    } finally {
+      tracker.observe(null);
+      vi.useRealTimers();
+    }
   });
 
   it("orders the inbox by the latest return this device observed", () => {

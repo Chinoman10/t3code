@@ -1,3 +1,4 @@
+import { resolvePullRequestDetailChecks } from "@t3tools/client-runtime/pull-request-checks";
 import {
   capitalizeTerm,
   sourceControlClients,
@@ -35,7 +36,6 @@ import {
   buildFixFindingsHandoff,
   buildResolveConflictsPrompt,
   classifyPullRequestChecks,
-  resolvePullRequestDetailChecks,
   describePullRequestChecks,
   isPullRequestConflicting,
   resolvePullRequestMergeMethod,
@@ -77,7 +77,7 @@ import {
   THREAD_DETAILS_PANEL_SPLIT_SEPARATOR_CLASS,
 } from "./threadDetailsPanelStyles";
 
-// A server without checks for this pull request answers null; polling it again finds nothing new.
+// A null checks response is settled; polling cannot find checks.
 const isSettledWithoutChecks = (result: AsyncResult.AsyncResult<unknown, unknown>) =>
   result._tag === "Success" && result.value === null;
 
@@ -125,8 +125,7 @@ export function ThreadDetailsPrRow({
           environmentId,
           input: { ...reference, allowStale: false },
         });
-  // Read the queries part by part: every poll publishes a new result (a new
-  // timestamp, `waiting` on and off) even when nothing in it changed.
+  // Select query parts because polling rebuilds unchanged results.
   const detailData = useEnvironmentQuerySelector(detailAtom, selectEnvironmentQueryData);
   const detailQuery = useEnvironmentQueryRefresh(detailAtom);
   const supportsChecks =
@@ -430,7 +429,7 @@ export function ThreadDetailsPrRow({
       {detail !== null && (showChecks || trailingAction !== null || watching) ? (
         <div className="pb-2">
           {openRow(detail.title, "row")}
-          <div className="-mt-1 flex h-6 min-w-0 items-center gap-0.5 ps-9 pe-1 text-xs text-muted-foreground">
+          <div className="flex h-6 min-w-0 items-center gap-0.5 ps-9 pe-1 text-xs text-muted-foreground">
             <span className="me-1 shrink-0 tabular-nums">#{number}</span>
             {showChecks && checksRollup !== null ? (
               <PullRequestChecksPopover
