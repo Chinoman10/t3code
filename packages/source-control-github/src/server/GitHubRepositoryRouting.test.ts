@@ -794,13 +794,19 @@ describe("native GitHub repository routing", () => {
     const { layer, requests } = harness();
     return Effect.gen(function* () {
       const prs = yield* GitHubPullRequestApi.GitHubPullRequestApi;
-      for (const read of [prs.getPullRequestSummary, prs.getPullRequestWatchFingerprint]) {
-        const pending = yield* Effect.all(
-          ["OwnerA/Repo", "OwnerB/Repo"].map((repository) =>
-            Effect.gen(function* () {
-              yield* read({ cwd: "/w", host: "github.com", repository, number: 1 });
-            }).pipe(Effect.flip),
-          ),
+      const reads: ReadonlyArray<
+        (
+          input: Parameters<typeof prs.getPullRequestSummary>[0],
+        ) => Effect.Effect<unknown, GitHubPullRequestApi.GitHubPullRequestApiError>
+      > = [prs.getPullRequestSummary, prs.getPullRequestWatchFingerprint];
+      for (const read of reads) {
+        const pending = yield* Effect.forEach(
+          ["OwnerA/Repo", "OwnerB/Repo"],
+          (repository) =>
+            read({ cwd: "/w", host: "github.com", repository, number: 1 }).pipe(
+              Effect.asVoid,
+              Effect.flip,
+            ),
           { concurrency: "unbounded" },
         ).pipe(Effect.forkChild);
         yield* TestClock.adjust("10 millis");

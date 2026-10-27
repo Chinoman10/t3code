@@ -368,7 +368,7 @@ export const make = Effect.gen(function* () {
   });
 
   return GitHubCredentials.of({
-    checkEnabled: (rawHost) => {
+    checkEnabled: Effect.fn("GitHubCredentials.checkEnabled")(function (rawHost) {
       const host = normalizeHost(rawHost);
       return hostChoice(host).pipe(
         Effect.flatMap((choice) =>
@@ -377,7 +377,7 @@ export const make = Effect.gen(function* () {
             : Effect.void,
         ),
       );
-    },
+    }),
     get: Effect.fn("GitHubCredentials.get")(function* (rawHost, repository) {
       const host = normalizeHost(rawHost);
       const choice = yield* hostChoice(host);
@@ -407,7 +407,7 @@ export const make = Effect.gen(function* () {
       }
       return yield* Cache.get(cache, cacheKey(host, choice?.account));
     }),
-    invalidate: (rawHost, repository) => {
+    invalidate: Effect.fn("GitHubCredentials.invalidate")(function (rawHost, repository) {
       const host = normalizeHost(rawHost);
       const normalized =
         repository === undefined ? null : normalizeCredentialRepository(repository);
@@ -429,7 +429,7 @@ export const make = Effect.gen(function* () {
       return hostChoice(host).pipe(
         Effect.flatMap((choice) => Cache.invalidate(cache, cacheKey(host, choice?.account))),
       );
-    },
+    }),
   });
 });
 

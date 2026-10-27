@@ -538,10 +538,9 @@ describe("repository Git credentials", () => {
       yield* Effect.gen(function* () {
         const credentials = yield* GitHubCredentials.GitHubCredentials;
         const unrelated = yield* credentials.get("github.com", "OwnerB/Repo");
-        const waiting = yield* Effect.all(
-          ["OwnerA/Repo", "ownera/repo"].map((repository) =>
-            credentials.get("github.com", repository),
-          ),
+        const waiting = yield* Effect.forEach(
+          ["OwnerA/Repo", "ownera/repo"],
+          (repository) => credentials.get("github.com", repository),
           { concurrency: "unbounded" },
         ).pipe(Effect.forkChild);
         yield* Deferred.await(startedUpper);

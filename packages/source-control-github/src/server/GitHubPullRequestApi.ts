@@ -73,6 +73,7 @@ import {
   toRepositoryAuthors,
   toRepositoryLabels,
   toPullRequestActivityPage,
+  toPullRequestCommitStats,
   toPullRequestCheckContextsPage,
   toPullRequestCore,
   toPullRequestFilesViewedPage,
@@ -1016,25 +1017,25 @@ export const make = Effect.gen(function* () {
                     decodeRoutingIdentity(response.body).pipe(Effect.mapError(unavailable)),
                   ),
                   Effect.catchTags({
-                    GitHubApiResponseError: (error) =>
-                      Effect.gen(function* () {
-                        if (error.status !== 403) return yield* error;
-                        const { viewer } = yield* client.RoutingIdentityViewer({}).pipe(
-                          GitHubGraphQlClient.call({
-                            host,
-                            repository: input.repository,
-                            operation: "getRoutingIdentity",
-                            allowReserve: input.allowPaused !== false,
-                          }),
-                          Effect.catchTags({
-                            GraphQLClientError: () => Effect.fail(unavailable()),
-                          }),
-                        );
-                        return yield* decodeViewerIdentity({
-                          id: viewer.databaseId,
-                          login: viewer.login,
-                        }).pipe(Effect.mapError(unavailable));
-                      }),
+                    // The enclosing operation owns the span for this inline handler.
+                    GitHubApiResponseError: Effect.fnUntraced(function* (error) {
+                      if (error.status !== 403) return yield* error;
+                      const { viewer } = yield* client.RoutingIdentityViewer({}).pipe(
+                        GitHubGraphQlClient.call({
+                          host,
+                          repository: input.repository,
+                          operation: "getRoutingIdentity",
+                          allowReserve: input.allowPaused !== false,
+                        }),
+                        Effect.catchTags({
+                          GraphQLClientError: () => Effect.fail(unavailable()),
+                        }),
+                      );
+                      return yield* decodeViewerIdentity({
+                        id: viewer.databaseId,
+                        login: viewer.login,
+                      }).pipe(Effect.mapError(unavailable));
+                    }),
                   }),
                   Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, credential),
                   Effect.provideService(SourceControlRateLimit.CredentialScope, key),
@@ -1665,18 +1666,16 @@ export const make = Effect.gen(function* () {
             ),
           ),
           listActionRequiredRuns(input).pipe(
-            Effect.flatMap((runs) =>
-              runs.length > workflowApprovalLimit
-                ? Effect.fail(
-                    new GitHubWorkflowApprovalRefusedError({
-                      cwd: input.cwd,
-                      number: input.number,
-                      reason: "run-list-truncated",
-                      observedCount: runs.length,
-                      limit: workflowApprovalLimit,
-                    }),
-                  )
-                : Effect.succeed(runs),
+            Effect.filterOrFail(
+              (runs) => !(runs.length > workflowApprovalLimit),
+              (runs) =>
+                new GitHubWorkflowApprovalRefusedError({
+                  cwd: input.cwd,
+                  number: input.number,
+                  reason: "run-list-truncated",
+                  observedCount: runs.length,
+                  limit: workflowApprovalLimit,
+                }),
             ),
           ),
         ],
@@ -1803,10 +1802,11 @@ export const make = Effect.gen(function* () {
     withVerifiedCredential,
     revalidateChecks,
     getRoutingIdentity,
-    getViewerLogin: (input) =>
-      getRoutingIdentity(input).pipe(Effect.map((identity) => identity.viewer)),
+    getViewerLogin: Effect.fn("GitHubPullRequestApi.getViewerLogin")(function (input) {
+      return getRoutingIdentity(input).pipe(Effect.map((identity) => identity.viewer));
+    }),
 
-    listPullRequests: (input) => {
+    listPullRequests: Effect.fn("GitHubPullRequestApi.listPullRequests")(function (input) {
       const fallbackMaxRows = Math.max(input.limit + 1, PULL_REQUEST_FALLBACK_MAX_ROWS);
       const { owner, name } = parseRepositorySelector(input.repository);
       const query = searchQuery({ ...input, repositories: [input.repository] });
@@ -1934,45 +1934,46 @@ export const make = Effect.gen(function* () {
           (batch) => batch.items.length > 0 || input.cursor !== undefined || hasQuery,
           () => read(false),
         ),
-        Effect.flatMap((batch) => {
-          if (!stacks || batch.items.length === 0) return Effect.succeed(batch);
-          return Effect.forEach(
-            batch.items,
-            (item) => {
-              const lookup = pullRequestLookup({
+        Effect.filterOrElse(
+          (batch) => !stacks || batch.items.length === 0,
+          (batch) =>
+            Effect.forEach(
+              batch.items,
+              (item) => {
+                const lookup = pullRequestLookup({
+                  repository: input.repository,
+                  number: item.number,
+                });
+                if (lookup === null) return Effect.succeed(item);
+                return GraphQLResolver.request(lookup, stackMembershipResolver).pipe(
+                  Effect.map((result) => {
+                    const pullRequest = result.repository?.pullRequest;
+                    const stack = pullRequest == null ? undefined : toStackMembership(pullRequest);
+                    return stack === undefined ? item : { ...item, stack };
+                  }),
+                  Effect.catch((error) =>
+                    Effect.logWarning("Pull request stack membership enrichment failed", {
+                      operation: "listPullRequestStackMemberships",
+                      host: input.host,
+                      error: error._tag,
+                    }).pipe(Effect.as(item)),
+                  ),
+                );
+              },
+              { concurrency: "unbounded" },
+            ).pipe(
+              Effect.provideService(GitHubGraphQlClient.GitHubGraphQlTarget, {
+                host: input.host,
                 repository: input.repository,
-                number: item.number,
-              });
-              if (lookup === null) return Effect.succeed(item);
-              return GraphQLResolver.request(lookup, stackMembershipResolver).pipe(
-                Effect.map((result) => {
-                  const pullRequest = result.repository?.pullRequest;
-                  const stack = pullRequest == null ? undefined : toStackMembership(pullRequest);
-                  return stack === undefined ? item : { ...item, stack };
-                }),
-                Effect.catch((error) =>
-                  Effect.logWarning("Pull request stack membership enrichment failed", {
-                    operation: "listPullRequestStackMemberships",
-                    host: input.host,
-                    error: error._tag,
-                  }).pipe(Effect.as(item)),
-                ),
-              );
-            },
-            { concurrency: "unbounded" },
-          ).pipe(
-            Effect.provideService(GitHubGraphQlClient.GitHubGraphQlTarget, {
-              host: input.host,
-              repository: input.repository,
-              operation: "listPullRequestStackMemberships",
-            }),
-            Effect.map((items) => ({ ...batch, items })),
-          );
-        }),
+                operation: "listPullRequestStackMemberships",
+              }),
+              Effect.map((items) => ({ ...batch, items })),
+            ),
+        ),
       );
-    },
+    }),
 
-    searchPullRequests: (input) => {
+    searchPullRequests: Effect.fn("GitHubPullRequestApi.searchPullRequests")(function* (input) {
       // Scoped pins are deliberately repository-local, including when two helpers return the
       // same token. A search may never silently borrow the first repository's credential.
       if (
@@ -1980,7 +1981,7 @@ export const make = Effect.gen(function* () {
         input.host.toLowerCase() === "github.com" &&
         input.repositories.length > 1
       ) {
-        return Effect.forEach(
+        return yield* Effect.forEach(
           input.repositories,
           (repository) =>
             service.searchPullRequests({
@@ -2002,15 +2003,13 @@ export const make = Effect.gen(function* () {
       }
       const query = searchQuery(input);
       if (query === null) {
-        return Effect.fail(
-          new GitHubRepositorySelectorError({
-            cwd: input.cwd,
-            operation: "searchPullRequests",
-          }),
-        );
+        return yield* new GitHubRepositorySelectorError({
+          cwd: input.cwd,
+          operation: "searchPullRequests",
+        });
       }
       const rows = Math.min(input.limit + 1, PULL_REQUEST_SEARCH_MAX_ROWS);
-      return client
+      return yield* client
         .PullRequestSearch({
           q: query,
           first: rows,
@@ -2040,7 +2039,7 @@ export const make = Effect.gen(function* () {
             };
           }),
         );
-    },
+    }),
 
     listPullRequestStats: Effect.fn("GitHubPullRequestApi.listPullRequestStats")(
       function* (input) {
@@ -2100,20 +2099,22 @@ export const make = Effect.gen(function* () {
     getPullRequestWatchFingerprint,
 
     getPullRequestDetail,
-    getPullRequestPreview: (input) => {
-      const { owner, name } = parseRepositorySelector(input.repository);
-      const operation = "getPullRequestPreview";
-      return client
-        .PullRequestPreview({ owner, name, number: input.number })
-        .pipe(
-          graphql({ ...input, operation }),
-          Effect.map(toPullRequestPreview),
-          Effect.flatMap(found({ ...input, operation })),
-        );
-    },
+    getPullRequestPreview: Effect.fn("GitHubPullRequestApi.getPullRequestPreview")(
+      function (input) {
+        const { owner, name } = parseRepositorySelector(input.repository);
+        const operation = "getPullRequestPreview";
+        return client
+          .PullRequestPreview({ owner, name, number: input.number })
+          .pipe(
+            graphql({ ...input, operation }),
+            Effect.map(toPullRequestPreview),
+            Effect.flatMap(found({ ...input, operation })),
+          );
+      },
+    ),
     listWorkflowRunsRequiringApproval,
 
-    getPullRequestStack: (input) => {
+    getPullRequestStack: Effect.fn("GitHubPullRequestApi.getPullRequestStack")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       // Polled by the pull request sync for every linked pull request, so revalidate it.
       return revalidatedRestRead({
@@ -2141,13 +2142,14 @@ export const make = Effect.gen(function* () {
           GitHubApiNotFoundError: () => Effect.succeed(null),
         }),
       );
-    },
+    }),
 
     getPullRequestActivity: Effect.fn("GitHubPullRequestApi.getPullRequestActivity")(
       function* (input) {
         const { owner, name } = parseRepositorySelector(input.repository);
         let author: PullRequestActor | null = null;
         let commits: ReadonlyArray<PullRequestCommit> = [];
+        let nonMergeCommitIds: ReadonlyArray<string> = [];
         const remarks: PullRequestComment[] = [];
         let commentsAfter: string | null = null;
         let reviewsAfter: string | null = null;
@@ -2174,6 +2176,7 @@ export const make = Effect.gen(function* () {
           if (page === 0) {
             author = read.author ?? null;
             commits = read.commits ?? [];
+            nonMergeCommitIds = read.nonMergeCommitIds;
           }
           remarks.push(...read.remarks);
           commentsAfter = read.nextCommentsCursor;
@@ -2181,17 +2184,26 @@ export const make = Effect.gen(function* () {
           withComments = withComments && commentsAfter !== null;
           withReviews = withReviews && reviewsAfter !== null;
         }
+        const emptyStats = toPullRequestCommitStats({ nodes: [] });
+        const commitStats =
+          nonMergeCommitIds.length === 0
+            ? emptyStats
+            : yield* client.PullRequestCommitStats({ ids: nonMergeCommitIds }).pipe(
+                graphql(target),
+                Effect.map(toPullRequestCommitStats),
+                Effect.orElseSucceed(() => emptyStats),
+              );
         return {
           author,
           comments: remarks.toSorted((left, right) =>
             left.createdAt.localeCompare(right.createdAt),
           ),
-          commits,
+          commits: commits.map((commit) => ({ ...commit, ...commitStats.get(commit.oid) })),
         } satisfies GitHubPullRequestActivity;
       },
     ),
 
-    getPullRequestDiff: (input) => {
+    getPullRequestDiff: Effect.fn("GitHubPullRequestApi.getPullRequestDiff")(function (input) {
       const filesPage = (page: number) =>
         diffFilesPage({
           cwd: input.cwd,
@@ -2235,35 +2247,37 @@ export const make = Effect.gen(function* () {
             GitHubApiResponseError: (error) => filesPage(1).pipe(Effect.mapError(() => error)),
           }),
         );
-    },
+    }),
 
     getPullRequestDiffFileContents,
 
-    getReviewThreadComments: (input) => {
-      const { owner, name } = parseRepositorySelector(input.repository);
-      return client
-        .ReviewThreadComments({
-          owner,
-          name,
-          number: input.number,
-          threadId: input.threadId,
-          after: input.cursor,
-        })
-        .pipe(
-          graphql({ ...input, operation: "getReviewThreadComments" }),
-          Effect.map(toReviewThreadCommentsPage),
-          Effect.flatMap(({ belongsToPullRequest, comments, nextCursor }) =>
-            belongsToPullRequest
-              ? Effect.succeed({ comments, nextCursor })
-              : Effect.fail(
-                  new GitHubSubjectScopeError({
-                    cwd: input.cwd,
-                    operation: "getReviewThreadComments",
-                  }),
-                ),
-          ),
-        );
-    },
+    getReviewThreadComments: Effect.fn("GitHubPullRequestApi.getReviewThreadComments")(
+      function (input) {
+        const { owner, name } = parseRepositorySelector(input.repository);
+        return client
+          .ReviewThreadComments({
+            owner,
+            name,
+            number: input.number,
+            threadId: input.threadId,
+            after: input.cursor,
+          })
+          .pipe(
+            graphql({ ...input, operation: "getReviewThreadComments" }),
+            Effect.map(toReviewThreadCommentsPage),
+            Effect.flatMap(({ belongsToPullRequest, comments, nextCursor }) =>
+              belongsToPullRequest
+                ? Effect.succeed({ comments, nextCursor })
+                : Effect.fail(
+                    new GitHubSubjectScopeError({
+                      cwd: input.cwd,
+                      operation: "getReviewThreadComments",
+                    }),
+                  ),
+            ),
+          );
+      },
+    ),
 
     listReviewThreadComments: Effect.fn("GitHubPullRequestApi.listReviewThreadComments")(
       function* (input) {
@@ -2291,10 +2305,6 @@ export const make = Effect.gen(function* () {
         const entries: GitHubReviewThreadEntry[] = [];
         const avatarsByLogin = new Map<string, string>();
         const botLogins = new Set<string>();
-        const commitStats = new Map<
-          string,
-          { readonly additions: number; readonly deletions: number }
-        >();
         let reviewers: ReadonlyArray<PullRequestActor> = [];
         let reactions: GitHubReviewThreadPage["reactions"] = [];
         const reactionsById = new Map<string, ReadonlyArray<PullRequestReaction>>();
@@ -2321,7 +2331,6 @@ export const make = Effect.gen(function* () {
             for (const [id, message] of read.dismissalsByReviewId)
               dismissalsByReviewId.set(id, message);
             dismissalCursor = read.nextDismissalCursor;
-            for (const [oid, stat] of read.commitStats) commitStats.set(oid, stat);
           }
           cursor = read.nextCursor;
           page += 1;
@@ -2374,23 +2383,22 @@ export const make = Effect.gen(function* () {
           reviewers,
           avatarsByLogin,
           botLogins,
-          commitStats,
           commits,
           viewer,
         };
       },
     ),
 
-    listActorAvatars: (input) => {
+    listActorAvatars: Effect.fn("GitHubPullRequestApi.listActorAvatars")(function (input) {
       if (input.ids.length === 0) {
         return Effect.succeed(new Map<string, string>());
       }
       return client
         .ActorAvatars({ ids: input.ids })
         .pipe(graphql({ ...input, operation: "listActorAvatars" }), Effect.map(toActorAvatars));
-    },
+    }),
 
-    getViewerAccess: (input) => {
+    getViewerAccess: Effect.fn("GitHubPullRequestApi.getViewerAccess")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       const operation = "getViewerAccess";
       return client
@@ -2400,21 +2408,23 @@ export const make = Effect.gen(function* () {
           Effect.map(toViewerPermissions),
           Effect.flatMap(found({ ...input, operation })),
         );
-    },
+    }),
 
-    listReviewerCandidates: (input) => {
-      const { owner, name } = parseRepositorySelector(input.repository);
-      const operation = "listReviewerCandidates";
-      return client
-        .ReviewerCandidates({ owner, name, number: input.number })
-        .pipe(
-          graphql({ ...input, operation, allowReserve: true }),
-          Effect.map(toReviewerCandidates),
-          Effect.flatMap(found({ ...input, operation })),
-        );
-    },
+    listReviewerCandidates: Effect.fn("GitHubPullRequestApi.listReviewerCandidates")(
+      function (input) {
+        const { owner, name } = parseRepositorySelector(input.repository);
+        const operation = "listReviewerCandidates";
+        return client
+          .ReviewerCandidates({ owner, name, number: input.number })
+          .pipe(
+            graphql({ ...input, operation, allowReserve: true }),
+            Effect.map(toReviewerCandidates),
+            Effect.flatMap(found({ ...input, operation })),
+          );
+      },
+    ),
 
-    setReviewerRequest: (input) => {
+    setReviewerRequest: Effect.fn("GitHubPullRequestApi.setReviewerRequest")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       return api
         .rest({
@@ -2426,9 +2436,9 @@ export const make = Effect.gen(function* () {
           body: buildReviewerRequest(input.reviewers),
         })
         .pipe(Effect.asVoid);
-    },
+    }),
 
-    listLabelCandidates: (input) => {
+    listLabelCandidates: Effect.fn("GitHubPullRequestApi.listLabelCandidates")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       const operation = "listLabelCandidates";
       return client
@@ -2438,9 +2448,9 @@ export const make = Effect.gen(function* () {
           Effect.map(toLabelCandidates),
           Effect.flatMap(found({ ...input, operation })),
         );
-    },
+    }),
 
-    listRepositoryLabels: (input) => {
+    listRepositoryLabels: Effect.fn("GitHubPullRequestApi.listRepositoryLabels")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       const operation = "listRepositoryLabels";
       return client
@@ -2450,21 +2460,23 @@ export const make = Effect.gen(function* () {
           Effect.map(toRepositoryLabels),
           Effect.flatMap(found({ ...input, operation })),
         );
-    },
+    }),
 
-    searchRepositoryAuthors: (input) => {
-      const { owner, name } = parseRepositorySelector(input.repository);
-      const operation = "searchRepositoryAuthors";
-      return client
-        .RepositoryAuthors({ owner, name, query: input.query ?? null })
-        .pipe(
-          graphql({ ...input, operation, allowReserve: true }),
-          Effect.map(toRepositoryAuthors),
-          Effect.flatMap(found({ ...input, operation })),
-        );
-    },
+    searchRepositoryAuthors: Effect.fn("GitHubPullRequestApi.searchRepositoryAuthors")(
+      function (input) {
+        const { owner, name } = parseRepositorySelector(input.repository);
+        const operation = "searchRepositoryAuthors";
+        return client
+          .RepositoryAuthors({ owner, name, query: input.query ?? null })
+          .pipe(
+            graphql({ ...input, operation, allowReserve: true }),
+            Effect.map(toRepositoryAuthors),
+            Effect.flatMap(found({ ...input, operation })),
+          );
+      },
+    ),
 
-    setLabels: (input) => {
+    setLabels: Effect.fn("GitHubPullRequestApi.setLabels")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       const issue = `repos/${owner}/${name}/issues/${input.number}/labels`;
       if (input.applied) {
@@ -2491,9 +2503,9 @@ export const make = Effect.gen(function* () {
           }),
         { concurrency: 1, discard: true },
       );
-    },
+    }),
 
-    runPullRequestAction: (input) => {
+    runPullRequestAction: Effect.fn("GitHubPullRequestApi.runPullRequestAction")(function (input) {
       if (input.action === "delete-branch") {
         return Effect.gen(function* () {
           if (input.stackNumber !== undefined) {
@@ -2748,19 +2760,20 @@ export const make = Effect.gen(function* () {
             : client.MergePullRequest({ input: merge }).pipe(Effect.asVoid)
         ).pipe(graphql(target));
       });
-    },
+    }),
 
-    commentOnPullRequest: (input) =>
-      pullRequestNodeId({ ...input, operation: "commentOnPullRequest" }).pipe(
+    commentOnPullRequest: Effect.fn("GitHubPullRequestApi.commentOnPullRequest")(function (input) {
+      return pullRequestNodeId({ ...input, operation: "commentOnPullRequest" }).pipe(
         Effect.flatMap((subjectId) =>
           client
             .AddComment({ subjectId, body: input.body })
             .pipe(graphql({ ...input, operation: "commentOnPullRequest" })),
         ),
         Effect.asVoid,
-      ),
+      );
+    }),
 
-    submitReview: (input) => {
+    submitReview: Effect.fn("GitHubPullRequestApi.submitReview")(function (input) {
       const { owner, name } = parseRepositorySelector(input.repository);
       return api
         .rest({
@@ -2776,96 +2789,107 @@ export const make = Effect.gen(function* () {
           }),
         })
         .pipe(Effect.asVoid);
-    },
+    }),
 
-    replyToReviewThread: (input) =>
-      client
+    replyToReviewThread: Effect.fn("GitHubPullRequestApi.replyToReviewThread")(function (input) {
+      return client
         .AddReviewThreadReply({ threadId: input.threadId, body: input.body })
-        .pipe(graphql({ ...input, operation: "replyToReviewThread" }), Effect.asVoid),
+        .pipe(graphql({ ...input, operation: "replyToReviewThread" }), Effect.asVoid);
+    }),
 
-    getPullRequestFilesViewed: (input) => {
-      const { owner, name } = parseRepositorySelector(input.repository);
-      const target = { ...input, operation: "getPullRequestFilesViewed" };
-      return readPages(
-        GraphQLClient.pages(client.PullRequestFilesViewed, {
-          variables: { owner, name, number: input.number },
-          connection: (result) => {
-            const page = toPullRequestFilesViewedPage(result);
-            return {
-              ...page,
-              pageInfo: { hasNextPage: page.nextCursor !== null, endCursor: page.nextCursor },
-            };
+    getPullRequestFilesViewed: Effect.fn("GitHubPullRequestApi.getPullRequestFilesViewed")(
+      function (input) {
+        const { owner, name } = parseRepositorySelector(input.repository);
+        const target = { ...input, operation: "getPullRequestFilesViewed" };
+        return readPages(
+          GraphQLClient.pages(client.PullRequestFilesViewed, {
+            variables: { owner, name, number: input.number },
+            connection: (result) => {
+              const page = toPullRequestFilesViewedPage(result);
+              return {
+                ...page,
+                pageInfo: { hasNextPage: page.nextCursor !== null, endCursor: page.nextCursor },
+              };
+            },
+          }),
+          {
+            ...target,
+            maxPages: FILES_VIEWED_MAX_PAGES,
+            hasNextPage: (page) => page.nextCursor !== null,
           },
-        }),
-        {
-          ...target,
-          maxPages: FILES_VIEWED_MAX_PAGES,
-          hasNextPage: (page) => page.nextCursor !== null,
-        },
-      ).pipe(
-        graphql(target),
-        Effect.map(({ pages, truncated }) => ({
-          files: pages.flatMap((page) => page.files),
-          truncated,
-        })),
-      );
-    },
+        ).pipe(
+          graphql(target),
+          Effect.map(({ pages, truncated }) => ({
+            files: pages.flatMap((page) => page.files),
+            truncated,
+          })),
+        );
+      },
+    ),
 
-    getPullRequestFileStats: (input) => {
-      const { owner, name } = parseRepositorySelector(input.repository);
-      const target = { ...input, operation: "getPullRequestFileStats" };
-      return readPages(
-        GraphQLClient.pages(client.PullRequestFileStats, {
-          variables: { owner, name, number: input.number },
-          connection: (result) => {
-            const page = toPullRequestFileStatsPage(result);
-            return {
-              ...page,
-              pageInfo: { hasNextPage: page.nextCursor !== null, endCursor: page.nextCursor },
-            };
+    getPullRequestFileStats: Effect.fn("GitHubPullRequestApi.getPullRequestFileStats")(
+      function (input) {
+        const { owner, name } = parseRepositorySelector(input.repository);
+        const target = { ...input, operation: "getPullRequestFileStats" };
+        return readPages(
+          GraphQLClient.pages(client.PullRequestFileStats, {
+            variables: { owner, name, number: input.number },
+            connection: (result) => {
+              const page = toPullRequestFileStatsPage(result);
+              return {
+                ...page,
+                pageInfo: { hasNextPage: page.nextCursor !== null, endCursor: page.nextCursor },
+              };
+            },
+          }),
+          {
+            ...target,
+            maxPages: FILES_VIEWED_MAX_PAGES,
+            hasNextPage: (page) => page.nextCursor !== null,
           },
-        }),
-        {
-          ...target,
-          maxPages: FILES_VIEWED_MAX_PAGES,
-          hasNextPage: (page) => page.nextCursor !== null,
-        },
-      ).pipe(
-        graphql(target),
-        Effect.map(({ pages, truncated }) => ({
-          files: pages.flatMap((page) => page.files),
-          truncated,
-        })),
-      );
-    },
+        ).pipe(
+          graphql(target),
+          Effect.map(({ pages, truncated }) => ({
+            files: pages.flatMap((page) => page.files),
+            truncated,
+          })),
+        );
+      },
+    ),
 
-    setPullRequestFilesViewed: (input) => {
-      if (input.files.length === 0) return Effect.void;
-      const target = { ...input, operation: "setPullRequestFilesViewed" };
-      return pullRequestNodeId(target).pipe(
-        Effect.flatMap((pullRequestId) =>
-          // Top-level mutation fields run in order, so the last toggle for a path wins.
-          Effect.forEach(
-            input.files,
-            (file) =>
-              GraphQLResolver.request(
-                { pullRequestId, path: file.path, viewed: file.viewed },
-                setFileViewedResolver,
-              ),
-            { concurrency: "unbounded", discard: true },
+    setPullRequestFilesViewed: Effect.fn("GitHubPullRequestApi.setPullRequestFilesViewed")(
+      function (input) {
+        if (input.files.length === 0) return Effect.void;
+        const target = { ...input, operation: "setPullRequestFilesViewed" };
+        return pullRequestNodeId(target).pipe(
+          Effect.flatMap((pullRequestId) =>
+            // Top-level mutation fields run in order, so the last toggle for a path wins.
+            Effect.forEach(
+              input.files,
+              (file) =>
+                GraphQLResolver.request(
+                  { pullRequestId, path: file.path, viewed: file.viewed },
+                  setFileViewedResolver,
+                ),
+              { concurrency: "unbounded", discard: true },
+            ),
           ),
-        ),
-        graphql(target),
-      );
-    },
+          graphql(target),
+        );
+      },
+    ),
 
-    setReviewThreadResolution: (input) =>
-      (input.resolved
-        ? client.ResolveReviewThread({ threadId: input.threadId }).pipe(Effect.asVoid)
-        : client.UnresolveReviewThread({ threadId: input.threadId }).pipe(Effect.asVoid)
-      ).pipe(graphql({ ...input, operation: "setReviewThreadResolution" })),
+    setReviewThreadResolution: Effect.fn("GitHubPullRequestApi.setReviewThreadResolution")(
+      function (input) {
+        return (
+          input.resolved
+            ? client.ResolveReviewThread({ threadId: input.threadId }).pipe(Effect.asVoid)
+            : client.UnresolveReviewThread({ threadId: input.threadId }).pipe(Effect.asVoid)
+        ).pipe(graphql({ ...input, operation: "setReviewThreadResolution" }));
+      },
+    ),
 
-    setReaction: (input) => {
+    setReaction: Effect.fn("GitHubPullRequestApi.setReaction")(function (input) {
       const givenSubjectId = input.subjectId;
       const subjectId =
         givenSubjectId === undefined
@@ -2896,10 +2920,10 @@ export const make = Effect.gen(function* () {
           ).pipe(graphql({ ...input, operation: "setReaction" }));
         }),
       );
-    },
+    }),
 
-    updatePullRequest: (input) =>
-      pullRequestNodeId({ ...input, operation: "updatePullRequest" }).pipe(
+    updatePullRequest: Effect.fn("GitHubPullRequestApi.updatePullRequest")(function (input) {
+      return pullRequestNodeId({ ...input, operation: "updatePullRequest" }).pipe(
         Effect.flatMap((pullRequestId) =>
           client
             .UpdatePullRequest({
@@ -2910,10 +2934,11 @@ export const make = Effect.gen(function* () {
             .pipe(graphql({ ...input, operation: "updatePullRequest" })),
         ),
         Effect.asVoid,
-      ),
+      );
+    }),
 
-    updateComment: (input) =>
-      subjectBelongsToPullRequest({
+    updateComment: Effect.fn("GitHubPullRequestApi.updateComment")(function (input) {
+      return subjectBelongsToPullRequest({
         cwd: input.cwd,
         repository: input.repository,
         host: input.host,
@@ -2939,68 +2964,113 @@ export const make = Effect.gen(function* () {
               : client.UpdateReviewComment(variables).pipe(Effect.asVoid)
           ).pipe(graphql({ ...input, operation: "updateComment" }));
         }),
-      ),
+      );
+    }),
   });
   // Capture once at each repository operation boundary. A later refusal invalidates the
   // source cache for the next operation; it cannot switch credentials midway through this one.
+  // The wrapped operations own their spans; these wrappers only install credential context.
   return GitHubPullRequestApi.of({
     ...service,
-    listPullRequests: (input) => withRepositoryCredential(input, service.listPullRequests(input)),
-    getPullRequestSummary: (input) =>
-      withRepositoryCredential(input, service.getPullRequestSummary(input)),
-    getPullRequestWatchFingerprint: (input) =>
-      withRepositoryCredential(input, service.getPullRequestWatchFingerprint(input)),
-    getPullRequestDetail: (input) =>
-      withRepositoryCredential(input, service.getPullRequestDetail(input)),
-    getPullRequestPreview: (input) =>
-      withRepositoryCredential(input, service.getPullRequestPreview(input)),
-    listWorkflowRunsRequiringApproval: (input) =>
-      withRepositoryCredential(input, service.listWorkflowRunsRequiringApproval(input)),
-    getPullRequestStack: (input) =>
-      withRepositoryCredential(input, service.getPullRequestStack(input)),
-    getPullRequestActivity: (input) =>
-      withRepositoryCredential(input, service.getPullRequestActivity(input)),
-    getPullRequestDiff: (input) =>
-      withRepositoryCredential(input, service.getPullRequestDiff(input)),
-    getPullRequestDiffFileContents: (input) =>
-      withRepositoryCredential(input, service.getPullRequestDiffFileContents(input)),
-    getPullRequestFilesViewed: (input) =>
-      withRepositoryCredential(input, service.getPullRequestFilesViewed(input)),
-    getPullRequestFileStats: (input) =>
-      withRepositoryCredential(input, service.getPullRequestFileStats(input)),
-    setPullRequestFilesViewed: (input) =>
-      withRepositoryCredential(input, service.setPullRequestFilesViewed(input)),
-    listReviewThreadComments: (input) =>
-      withRepositoryCredential(input, service.listReviewThreadComments(input)),
-    listActorAvatars: (input) => withRepositoryCredential(input, service.listActorAvatars(input)),
-    getReviewThreadComments: (input) =>
-      withRepositoryCredential(input, service.getReviewThreadComments(input)),
-    getViewerAccess: (input) => withRepositoryCredential(input, service.getViewerAccess(input)),
-    listReviewerCandidates: (input) =>
-      withRepositoryCredential(input, service.listReviewerCandidates(input)),
-    setReviewerRequest: (input) =>
-      withRepositoryCredential(input, service.setReviewerRequest(input)),
-    listLabelCandidates: (input) =>
-      withRepositoryCredential(input, service.listLabelCandidates(input)),
-    listRepositoryLabels: (input) =>
-      withRepositoryCredential(input, service.listRepositoryLabels(input)),
-    searchRepositoryAuthors: (input) =>
-      withRepositoryCredential(input, service.searchRepositoryAuthors(input)),
-    setLabels: (input) => withRepositoryCredential(input, service.setLabels(input)),
-    runPullRequestAction: (input) =>
-      withRepositoryCredential(input, service.runPullRequestAction(input)),
-    commentOnPullRequest: (input) =>
-      withRepositoryCredential(input, service.commentOnPullRequest(input)),
-    submitReview: (input) => withRepositoryCredential(input, service.submitReview(input)),
-    replyToReviewThread: (input) =>
-      withRepositoryCredential(input, service.replyToReviewThread(input)),
-    setReviewThreadResolution: (input) =>
-      withRepositoryCredential(input, service.setReviewThreadResolution(input)),
-    setReaction: (input) => withRepositoryCredential(input, service.setReaction(input)),
-    updatePullRequest: (input) => withRepositoryCredential(input, service.updatePullRequest(input)),
-    updateComment: (input) => withRepositoryCredential(input, service.updateComment(input)),
-    revalidateChecks: (input, read) =>
-      withRepositoryCredential(input, service.revalidateChecks(input, read)),
+    listPullRequests: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.listPullRequests(input));
+    }),
+    getPullRequestSummary: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestSummary(input));
+    }),
+    getPullRequestWatchFingerprint: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestWatchFingerprint(input));
+    }),
+    getPullRequestDetail: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestDetail(input));
+    }),
+    getPullRequestPreview: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestPreview(input));
+    }),
+    listWorkflowRunsRequiringApproval: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(
+        input,
+        service.listWorkflowRunsRequiringApproval(input),
+      );
+    }),
+    getPullRequestStack: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestStack(input));
+    }),
+    getPullRequestActivity: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestActivity(input));
+    }),
+    getPullRequestDiff: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestDiff(input));
+    }),
+    getPullRequestDiffFileContents: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestDiffFileContents(input));
+    }),
+    getPullRequestFilesViewed: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestFilesViewed(input));
+    }),
+    getPullRequestFileStats: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getPullRequestFileStats(input));
+    }),
+    setPullRequestFilesViewed: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.setPullRequestFilesViewed(input));
+    }),
+    listReviewThreadComments: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.listReviewThreadComments(input));
+    }),
+    listActorAvatars: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.listActorAvatars(input));
+    }),
+    getReviewThreadComments: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getReviewThreadComments(input));
+    }),
+    getViewerAccess: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.getViewerAccess(input));
+    }),
+    listReviewerCandidates: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.listReviewerCandidates(input));
+    }),
+    setReviewerRequest: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.setReviewerRequest(input));
+    }),
+    listLabelCandidates: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.listLabelCandidates(input));
+    }),
+    listRepositoryLabels: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.listRepositoryLabels(input));
+    }),
+    searchRepositoryAuthors: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.searchRepositoryAuthors(input));
+    }),
+    setLabels: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.setLabels(input));
+    }),
+    runPullRequestAction: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.runPullRequestAction(input));
+    }),
+    commentOnPullRequest: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.commentOnPullRequest(input));
+    }),
+    submitReview: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.submitReview(input));
+    }),
+    replyToReviewThread: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.replyToReviewThread(input));
+    }),
+    setReviewThreadResolution: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.setReviewThreadResolution(input));
+    }),
+    setReaction: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.setReaction(input));
+    }),
+    updatePullRequest: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.updatePullRequest(input));
+    }),
+    updateComment: Effect.fnUntraced(function* (input) {
+      return yield* withRepositoryCredential(input, service.updateComment(input));
+    }),
+    revalidateChecks: Effect.fnUntraced(function* (input, read) {
+      return yield* withRepositoryCredential(input, service.revalidateChecks(input, read));
+    }),
   });
 });
 
