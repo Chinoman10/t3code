@@ -1,3 +1,4 @@
+import { normalizeHost } from "@t3tools/source-control-core/server/pullRequestUtils";
 import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -30,7 +31,7 @@ const TOKEN_TTL = Duration.minutes(5);
 /** No credential is retried sooner, so a fresh `gh auth login` takes effect on the next read. */
 const MISSING_TTL = Duration.seconds(10);
 
-export const GitHubCredentialSource = Schema.Literals(["settings", "env", "gh", "git"]);
+export const GitHubCredentialSource = Schema.Literals(["settings", "app", "env", "gh", "git"]);
 export type GitHubCredentialSource = typeof GitHubCredentialSource.Type;
 
 export interface GitHubCredential {
@@ -126,14 +127,29 @@ export class GitHubCredentials extends Context.Service<
       host: string,
       repository?: string,
     ) => Effect.Effect<GitHubCredential, GitHubCredentialUnavailableError>;
-    /** Drops the held token after GitHub refused it, so the next read asks its source again. */
+    /** Trusted repository helper when opted in, otherwise the token saved in Settings. */
+    readonly saved: (
+      host: string,
+      repository?: string,
+    ) => Effect.Effect<
+      Option.Option<GitHubCredential>,
+      GitHubHostDisabledError | GitHubNotSignedInError | GitHubGitCredentialError
+    >;
+    readonly fingerprint: (host: string, token: string) => Effect.Effect<string>;
+    /** Drops only the source that supplied the refused credential. */
     readonly invalidate: (host: string, repository?: string) => Effect.Effect<void>;
-    readonly checkEnabled?: (host: string) => Effect.Effect<void, GitHubHostDisabledError>;
+    readonly checkEnabled?: (
+      host: string,
+    ) => Effect.Effect<void, GitHubHostDisabledError | GitHubNotSignedInError>;
   }
 >()("@t3tools/source-control-github/server/GitHubCredentials") {}
 
-function normalizeHost(host: string): string {
-  return host.trim().toLowerCase();
+const HOSTNAME =
+  /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::\d{1,5})?$/;
+
+/** API URLs are built from the host text, so anything but a bare hostname could redirect a token. */
+export function isGitHubHost(host: string): boolean {
+  return HOSTNAME.test(host);
 }
 
 function isGitHubDotCom(host: string): boolean {
@@ -145,6 +161,7 @@ export function environmentToken(
   host: string,
   env: Readonly<Record<string, string | undefined>>,
 ): string | null {
+  if (!isGitHubHost(host)) return null;
   const names = isGitHubDotCom(host)
     ? ["GH_TOKEN", "GITHUB_TOKEN"]
     : env.GH_HOST?.trim().toLowerCase() === host
@@ -367,46 +384,50 @@ export const make = Effect.gen(function* () {
       Exit.isFailure(exit) ? Duration.zero : exit.value === null ? MISSING_TTL : TOKEN_TTL,
   });
 
+  const checkEnabled = Effect.fn("GitHubCredentials.checkEnabled")(function* (rawHost: string) {
+    const host = normalizeHost(rawHost);
+    if (!isGitHubHost(host)) return yield* new GitHubNotSignedInError({ host });
+    if ((yield* hostChoice(host))?.enabled === false) {
+      return yield* new GitHubHostDisabledError({ host });
+    }
+  });
+
+  const saved = Effect.fn("GitHubCredentials.saved")(function* (
+    rawHost: string,
+    repository?: string,
+  ) {
+    const host = normalizeHost(rawHost);
+    yield* checkEnabled(host);
+    if (
+      environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS === "1" &&
+      host === "github.com" &&
+      repository !== undefined
+    ) {
+      if (normalizeCredentialRepository(repository) === null)
+        return yield* new GitHubGitCredentialError({ host, reason: "repository" });
+      const credential = yield* Cache.get(gitCache, repository.replace(/\.git$/i, ""));
+      if (credential !== null) return Option.some(credential);
+    }
+    const token = yield* savedToken(host);
+    if (token === null) return Option.none<GitHubCredential>();
+    return Option.some<GitHubCredential>({
+      host,
+      token: Redacted.make(token),
+      source: "settings",
+      fingerprint: yield* fingerprintOf(host, token),
+    });
+  });
+
   return GitHubCredentials.of({
-    checkEnabled: Effect.fn("GitHubCredentials.checkEnabled")(function (rawHost) {
-      const host = normalizeHost(rawHost);
-      return hostChoice(host).pipe(
-        Effect.flatMap((choice) =>
-          choice?.enabled === false
-            ? Effect.fail(new GitHubHostDisabledError({ host }))
-            : Effect.void,
-        ),
-      );
-    }),
+    checkEnabled,
     get: Effect.fn("GitHubCredentials.get")(function* (rawHost, repository) {
       const host = normalizeHost(rawHost);
-      const choice = yield* hostChoice(host);
-      if (choice?.enabled === false) {
-        return yield* new GitHubHostDisabledError({ host });
-      }
-      if (
-        environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS === "1" &&
-        host === "github.com" &&
-        repository !== undefined
-      ) {
-        if (normalizeCredentialRepository(repository) === null)
-          return yield* new GitHubGitCredentialError({ host, reason: "repository" });
-        const credential = yield* Cache.get(gitCache, repository.replace(/\.git$/i, ""));
-        if (credential !== null) return credential;
-      }
-      // A token saved in Settings is the most deliberate choice, so it comes before the
-      // environment and gh. It is read from the secret store each time, so it needs no cache.
-      const saved = yield* savedToken(host);
-      if (saved !== null) {
-        return {
-          host,
-          token: Redacted.make(saved),
-          source: "settings",
-          fingerprint: yield* fingerprintOf(host, saved),
-        } satisfies GitHubCredential;
-      }
-      return yield* Cache.get(cache, cacheKey(host, choice?.account));
+      const preferred = yield* saved(host, repository);
+      if (Option.isSome(preferred)) return preferred.value;
+      return yield* Cache.get(cache, cacheKey(host, (yield* hostChoice(host))?.account));
     }),
+    saved,
+    fingerprint: fingerprintOf,
     invalidate: Effect.fn("GitHubCredentials.invalidate")(function (rawHost, repository) {
       const host = normalizeHost(rawHost);
       const normalized =

@@ -22,6 +22,14 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 import * as GitHubCredentials from "./GitHubCredentials.ts";
+import * as GitHubAppSignIn from "./GitHubAppSignIn.ts";
+import * as GitHubAppAccess from "./GitHubAppAccess.ts";
+
+const appSignedOut = Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+  enabled: false,
+  token: () => Effect.succeedNone,
+  invalidate: () => Effect.void,
+});
 import * as GitHubRest from "./GitHubRest.ts";
 import * as GitHubQuota from "./GitHubQuota.ts";
 import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
@@ -305,9 +313,16 @@ describe("repository Git credentials", () => {
             );
           }),
         );
-        const transport = GitHubRest.layer.pipe(
+        const transport = GitHubAppAccess.layer.pipe(
+          Layer.provideMerge(GitHubRest.layer),
           Layer.provideMerge(
-            Layer.mergeAll(layer, http, GitHubQuota.layer, SourceControlRateLimit.layer),
+            Layer.mergeAll(
+              layer,
+              http,
+              GitHubQuota.layer,
+              SourceControlRateLimit.layer,
+              appSignedOut,
+            ),
           ),
         );
         yield* Effect.gen(function* () {
@@ -585,7 +600,13 @@ describe("repository Git credentials", () => {
       );
       const transport = GitHubRest.layer.pipe(
         Layer.provideMerge(
-          Layer.mergeAll(layer, http, GitHubQuota.layer, SourceControlRateLimit.layer),
+          Layer.mergeAll(
+            layer,
+            http,
+            GitHubQuota.layer,
+            SourceControlRateLimit.layer,
+            appSignedOut,
+          ),
         ),
       );
       return Effect.gen(function* () {

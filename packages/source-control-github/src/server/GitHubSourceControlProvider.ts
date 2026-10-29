@@ -27,6 +27,8 @@ import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import { isSshRemoteUrl } from "@t3tools/shared/sourceControl";
 
 import { GH_PROCESS_CONCURRENCY } from "./GitHubCredentials.ts";
+import * as GitHubAppSignIn from "./GitHubAppSignIn.ts";
+import * as GitHubAppAccess from "./GitHubAppAccess.ts";
 import * as GitHubRest from "./GitHubRest.ts";
 import * as GitHubRequestPolicy from "./GitHubRequestPolicy.ts";
 import * as GitHubChangeRequestTemplate from "./gitHubChangeRequestTemplate.ts";
@@ -214,6 +216,9 @@ export const makeDiscovery = Effect.gen(function* () {
   const process = sourceControlHost.process;
   const environment = yield* HostProcess.Environment;
   const workingDirectory = yield* HostProcess.WorkingDirectory;
+  const appSignIn = yield* GitHubAppSignIn.GitHubAppSignIn;
+  const offerAppSignIn = <A extends SourceControlProviderDiscoveryItem>(item: A): A =>
+    appSignIn.enabled ? { ...item, appSignIn: true } : item;
 
   return {
     type: "managed-cli",
@@ -236,8 +241,15 @@ export const makeDiscovery = Effect.gen(function* () {
         spec: { ...discovery, parseAuth: (input) => parseGitHubAuth(input, settings) },
       });
       const savedToken = (settings.tokens["github.com"] ?? "").trim() !== "";
+      const signedIn =
+        appSignIn.enabled && !savedToken && (settings.signIns["github.com"] ?? "").trim() !== "";
       const variable = environmentTokenVariable(environment);
-      const tokenSource = savedToken ? "the token saved in Settings" : variable;
+      const appName = GitHubClient.APP_SIGN_IN.appName;
+      const tokenSource = savedToken
+        ? "the token saved in Settings"
+        : signedIn
+          ? `the ${appName} sign-in`
+          : variable;
       const repositoryFallback = Effect.fn("GitHubSourceControlProvider.repositoryFallback")(
         function* (item: SourceControlProviderDiscoveryItem) {
           if (
@@ -277,8 +289,8 @@ export const makeDiscovery = Effect.gen(function* () {
         },
       );
       // A host turned off in Settings stays off even with a token.
-      if (settings.hosts["github.com"]?.enabled === false) return cli;
-      if (tokenSource === null) return yield* repositoryFallback(cli);
+      if (settings.hosts["github.com"]?.enabled === false) return offerAppSignIn(cli);
+      if (tokenSource === null) return offerAppSignIn(yield* repositoryFallback(cli));
       const viewer = yield* api
         .rest({ host: "github.com", operation: "discovery", path: "user" })
         .pipe(Effect.result);
@@ -286,35 +298,41 @@ export const makeDiscovery = Effect.gen(function* () {
         ? Option.getOrUndefined(decodeViewer(viewer.success.body))?.login
         : undefined;
       const accounts = cli.auth.accounts === undefined ? {} : { accounts: cli.auth.accounts };
-      return yield* repositoryFallback({
-        ...cli,
-        status: "available" as const,
-        auth: {
-          ...(login !== undefined
-            ? providerAuth({
-                status: "authenticated",
-                account: login,
-                host: "github.com",
-                detail: savedToken
-                  ? "Using the token saved in Settings; it overrides GH_TOKEN and the gh login."
-                  : `Using ${variable} from the server environment; it overrides the account chosen in Settings.`,
-              })
-            : Result.isFailure(viewer) && viewer.failure._tag !== "GitHubApiAuthenticationError"
+      return offerAppSignIn(
+        yield* repositoryFallback({
+          ...cli,
+          status: "available" as const,
+          auth: {
+            ...(login !== undefined
               ? providerAuth({
-                  status: "unknown",
-                  host: "github.com",
-                  detail: `Could not check ${savedToken ? tokenSource : `the token in ${tokenSource}`}: ${viewer.failure.message}`,
-                })
-              : providerAuth({
-                  status: "unauthenticated",
+                  status: "authenticated",
+                  account: login,
                   host: "github.com",
                   detail: savedToken
-                    ? "GitHub refused the token saved in Settings. Replace or remove it in Settings → Source Control."
-                    : `GitHub refused the token in ${tokenSource}. Replace it, or unset it to use \`gh auth login\`.`,
-                })),
-          ...accounts,
-        },
-      } satisfies SourceControlProviderDiscoveryItem);
+                    ? "Using the token saved in Settings; it overrides GH_TOKEN and the gh login."
+                    : signedIn
+                      ? `Signed in with ${appName}.`
+                      : `Using ${variable} from the server environment; it overrides the account chosen in Settings.`,
+                })
+              : Result.isFailure(viewer) && viewer.failure._tag !== "GitHubApiAuthenticationError"
+                ? providerAuth({
+                    status: "unknown",
+                    host: "github.com",
+                    detail: `Could not check ${savedToken || signedIn ? tokenSource : `the token in ${tokenSource}`}: ${viewer.failure.message}`,
+                  })
+                : providerAuth({
+                    status: "unauthenticated",
+                    host: "github.com",
+                    detail: savedToken
+                      ? "GitHub refused the token saved in Settings. Replace or remove it in Settings → Source Control."
+                      : signedIn
+                        ? `GitHub refused the ${appName} sign-in. Sign in again in Settings → Source Control.`
+                        : `GitHub refused the token in ${tokenSource}. Replace it, or unset it to use \`gh auth login\`.`,
+                  })),
+            ...accounts,
+          },
+        } satisfies SourceControlProviderDiscoveryItem),
+      );
     }),
     // Claim disabled hosts so errors identify the setting.
     refineUnknownRemote: ({ context }) => {
@@ -380,6 +398,7 @@ function fromGitHubApiError(
       return failure(notFound, error);
     case "GitHubCliFailedError":
     case "GitHubGitCredentialError":
+    case "GitHubAppSessionError":
     case "GitHubApiResponseError":
     case "GitHubApiRequestError":
       return failure(error.message.trim() || "GitHub request failed.", error);
@@ -468,6 +487,7 @@ const contextHost = (context: SourceControlProvider.SourceControlProviderContext
 
 export const make = Effect.gen(function* () {
   const api = yield* GitHubRest.GitHubRest;
+  const appAccess = yield* GitHubAppAccess.GitHubAppAccess;
   const sourceControlHost = yield* SourceControlHost.SourceControlHost;
   const process = sourceControlHost.process;
   const environment = yield* HostProcess.Environment;
@@ -540,13 +560,14 @@ export const make = Effect.gen(function* () {
     ) {
       if (environment.T3CODE_GITHUB_USE_GIT_CREDENTIALS !== "1")
         return yield* effect.pipe(GitHubGraphQlClient.call(target));
-      const credential = yield* api.credential(target.host, target.repository);
+      const credential = yield* api.credential(target.host, { repository: target.repository });
       return yield* effect.pipe(
         GitHubGraphQlClient.call(target),
         Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
           host: target.host.toLowerCase(),
           token: credential.token,
           credentialFingerprint: credential.fingerprint,
+          fromApp: credential.fromApp === true,
           ...(credential.repository === undefined ? {} : { repository: credential.repository }),
           ...(credential.credentialRepository === undefined
             ? {}
@@ -824,7 +845,9 @@ export const make = Effect.gen(function* () {
       );
 
       yield* Effect.gen(function* () {
-        if (!exists) yield* runGit(input.cwd, "branch", ["branch", "--", localBranch, target.ref]);
+        if (!exists) {
+          yield* git.createBranch({ cwd: input.cwd, branch: localBranch, startPoint: target.ref });
+        }
         yield* Effect.scoped(git.switchRef({ cwd: input.cwd, refName: localBranch }));
         if (exists) {
           yield* runGit(
@@ -967,13 +990,8 @@ export const make = Effect.gen(function* () {
       baseBranch,
     }) {
       return git
-        .execute({
-          operation: "GitHubSourceControlProvider.recordBranchBase",
-          cwd,
-          args: ["config", `branch.${branch}.gh-merge-base`, baseBranch],
-        })
+        .writeConfigValue({ cwd, key: `branch.${branch}.gh-merge-base`, value: baseBranch })
         .pipe(
-          Effect.asVoid,
           Effect.catch((cause) =>
             Effect.logWarning("Could not record the branch base for gh", { cause }),
           ),
@@ -1067,7 +1085,11 @@ export const make = Effect.gen(function* () {
         const locator =
           parseGitHubRepositorySelector(input.repository, fallbackHost) ??
           (/^[^/\s]+$/.test(bareName)
-            ? { host: fallbackHost, owner: yield* readViewerLogin(fallbackHost), name: bareName }
+            ? {
+                host: fallbackHost,
+                owner: yield* readViewerLogin(fallbackHost),
+                name: bareName,
+              }
             : null);
         if (locator === null) return yield* failure("Repositories are named owner/name.");
         return repositoryCloneUrls(yield* readRepository(locator));
@@ -1075,7 +1097,9 @@ export const make = Effect.gen(function* () {
       (effect, input) =>
         effect.pipe(
           Effect.mapError(
-            providerError("getRepositoryCloneUrls", input.cwd, { repository: input.repository }),
+            providerError("getRepositoryCloneUrls", input.cwd, {
+              repository: input.repository,
+            }),
           ),
         ),
     ),
@@ -1120,14 +1144,15 @@ export const make = Effect.gen(function* () {
             (environment.GH_HOST ?? "github.com").toLowerCase(),
           );
           if (locator === null || locator.host !== "github.com") return yield* effect;
-          const credential = yield* api
-            .credential(locator.host, `${locator.owner}/${locator.name}`)
+          const credential = yield* appAccess
+            .credentialFor(locator.host, `${locator.owner}/${locator.name}`)
             .pipe(Effect.mapError(fromGitHubApiError));
           return yield* effect.pipe(
             Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
               host: locator.host,
               token: credential.token,
               credentialFingerprint: credential.fingerprint,
+              fromApp: credential.fromApp === true,
               ...(credential.repository === undefined ? {} : { repository: credential.repository }),
               ...(credential.credentialRepository === undefined
                 ? {}

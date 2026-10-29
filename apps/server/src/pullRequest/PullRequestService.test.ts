@@ -37,6 +37,14 @@ import type { SourceControlProvider } from "@t3tools/source-control-core/server/
 import { isSshRemoteUrl } from "@t3tools/shared/sourceControl";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubRest from "../../../../packages/source-control-github/src/server/GitHubRest.ts";
+import * as GitHubAppAccess from "../../../../packages/source-control-github/src/server/GitHubAppAccess.ts";
+import * as GitHubAppSignIn from "../../../../packages/source-control-github/src/server/GitHubAppSignIn.ts";
+
+const appSignedOut = Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+  enabled: false,
+  token: () => Effect.succeedNone,
+  invalidate: () => Effect.void,
+});
 import * as GitHubRequestPolicy from "../../../../packages/source-control-github/src/server/GitHubRequestPolicy.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
@@ -130,6 +138,65 @@ function hostedChangeRequest(body: string, additions = 1) {
     },
   };
 }
+
+it.effect("reads maintainer edits and changes them through the update command", () =>
+  Effect.gen(function* () {
+    let enabled = true;
+    const provider = fakePullRequestProvider(SourceControlProviderKind.make("github"), {
+      getChangeRequest: () =>
+        Effect.succeed({ ...hostedChangeRequest("Body"), maintainerCanModify: enabled }),
+      updateChangeRequest: (input) =>
+        Effect.sync(() => {
+          assert.strictEqual(input.title, undefined);
+          assert.strictEqual(input.body, undefined);
+          enabled = input.maintainerCanModify!;
+        }),
+    });
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "web", workspaceRoot: "/w", repository: "acme/web" })],
+      providers: [
+        {
+          ...provider,
+          capabilities: {
+            ...provider.capabilities,
+            edit: { changeRequest: true, comment: true, maintainerEdits: true },
+          },
+        },
+      ],
+    });
+    const ref = { projectId: "p1" as ProjectId, repository: "acme/web", number: 1 };
+    assert.strictEqual((yield* service.detail(ref)).maintainerCanModify, true);
+    yield* service.update({ ...ref, maintainerCanModify: false });
+    assert.strictEqual((yield* service.detail(ref)).maintainerCanModify, false);
+  }),
+);
+
+it.effect("refuses maintainer edits on a host without the capability", () =>
+  Effect.gen(function* () {
+    let writes = 0;
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "web", workspaceRoot: "/w", repository: "acme/web" })],
+      providers: [
+        fakePullRequestProvider(SourceControlProviderKind.make("github"), {
+          updateChangeRequest: () =>
+            Effect.sync(() => {
+              writes += 1;
+            }),
+        }),
+      ],
+    });
+    const result = yield* service
+      .update({
+        projectId: "p1" as ProjectId,
+        repository: "acme/web",
+        number: 1,
+        maintainerCanModify: false,
+      })
+      .pipe(Effect.flip);
+    assert.strictEqual(result._tag, "PullRequestOperationError");
+    assert.strictEqual(writes, 0);
+  }),
+);
 
 it.effect("does not wait for an in-flight detail read to display a preview", () =>
   Effect.gen(function* () {
@@ -1021,6 +1088,7 @@ it.effect(
       );
       const context = yield* Layer.build(
         GitHubPullRequestApi.layer.pipe(
+          Layer.provideMerge(GitHubAppAccess.layer),
           Layer.provideMerge(
             GitHubRest.layerWithDependencies.pipe(
               Layer.provideMerge(SourceControlRateLimit.layer),
@@ -1038,7 +1106,7 @@ it.effect(
       const lookup = (input: { readonly host: string; readonly repository: string }) => {
         lookups.push(input.repository);
         return policy
-          .credential(input.host, input.repository)
+          .credential(input.host, { repository: input.repository })
           .pipe(Effect.mapError(() => requestFailed));
       };
       const provider = fakePullRequestProvider(SourceControlProviderKind.make("github"), {
@@ -1172,6 +1240,8 @@ it.effect("pauses repository viewer discovery while preserving interactive crede
       Effect.orDie,
     );
     const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+      saved: () => Effect.succeedNone,
+      fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
       get: (host) =>
         Effect.succeed({
           host,
@@ -1200,9 +1270,10 @@ it.effect("pauses repository viewer discovery while preserving interactive crede
     const native = yield* GitHubPullRequestProvider.make.pipe(
       Effect.provide(
         GitHubPullRequestApi.layer.pipe(
+          Layer.provideMerge(GitHubAppAccess.layer),
           Layer.provide(
             GitHubRest.layer.pipe(
-              Layer.provideMerge(Layer.mergeAll(credentials, http)),
+              Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
               Layer.provideMerge(GitHubQuota.layer),
               Layer.provideMerge(
                 Layer.succeed(SourceControlRateLimit.SourceControlRateLimit, limits),
@@ -1475,6 +1546,7 @@ it.effect.each([
       ).pipe(Layer.provide(host));
       const apiContext = yield* Layer.build(
         GitHubPullRequestApi.layer.pipe(
+          Layer.provideMerge(GitHubAppAccess.layer),
           Layer.provideMerge(
             GitHubRest.layerWithDependencies.pipe(Layer.provideMerge(SourceControlRateLimit.layer)),
           ),
@@ -1793,7 +1865,11 @@ it.effect("routing verifies the current account on the requested host without ca
       providers: [
         fakePullRequestProvider(SourceControlProviderKind.make("github"), {
           getRoutingIdentity: (input) => {
-            assert.deepStrictEqual(input, { cwd: "/a", host: "github.example.test" });
+            assert.deepStrictEqual(input, {
+              cwd: "/a",
+              host: "github.example.test",
+              repository: "acme/web",
+            });
             return Effect.succeed({
               viewer,
               accountId: viewer === "first-account" ? "123" : "456",

@@ -15,6 +15,14 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "./GitHubRest.ts";
+import * as GitHubAppAccess from "./GitHubAppAccess.ts";
+import * as GitHubAppSignIn from "./GitHubAppSignIn.ts";
+
+const appSignedOut = Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+  enabled: false,
+  token: () => Effect.succeedNone,
+  invalidate: () => Effect.void,
+});
 import * as GitHubPullRequestApi from "./GitHubPullRequestApi.ts";
 import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
 import * as GitHubRequestPolicy from "./GitHubRequestPolicy.ts";
@@ -121,6 +129,7 @@ function harness(
     Layer.provide(NodeCrypto.layer),
   );
   const layer = GitHubPullRequestApi.layer.pipe(
+    Layer.provideMerge(GitHubAppAccess.layer),
     Layer.provideMerge(api),
     Layer.provideMerge(NodeServices.layer),
     Layer.provide(
@@ -187,6 +196,7 @@ describe("native GitHub repository routing", () => {
       const revalidate = yield* makeChecksRevalidator.pipe(
         Effect.provideService(GitHubApi.GitHubRest, {
           credential: () => Effect.die("already pinned"),
+          appCredential: () => Effect.die("already pinned"),
           rest: (input) => {
             expect(input.repository).toBe(ref.repository);
             expect(input.host).toBe(ref.host);
@@ -240,7 +250,7 @@ describe("native GitHub repository routing", () => {
       expect(error._tag).toBe("GitHubApiAuthenticationError");
       expect(requests).toHaveLength(1);
       expect(requests[0]?.headers.authorization).toBe("Bearer host-default");
-      const ownB = yield* api.credential("github.com", "OwnerB/Repo");
+      const ownB = yield* api.credential("github.com", { repository: "OwnerB/Repo" });
       expect(Redacted.value(ownB.token)).toBe("fake-OwnerB-1");
       expect(helperPaths).toEqual(["OwnerA/Repo.git", "OwnerB/Repo.git"]);
     }).pipe(Effect.provide(layer));
@@ -280,7 +290,9 @@ describe("native GitHub repository routing", () => {
       const prs = yield* GitHubPullRequestApi.GitHubPullRequestApi;
       const api = yield* GitHubApi.GitHubRest;
       const error = yield* prs.withVerifiedCredential({ cwd: "/w", host: "github.com" }, () =>
-        api.credential("github.com", "owner/repo\npassword=unsafe").pipe(Effect.flip),
+        api
+          .credential("github.com", { repository: "owner/repo\npassword=unsafe" })
+          .pipe(Effect.flip),
       );
       expect(error._tag).toBe("GitHubGitCredentialError");
       expect(requests).toHaveLength(1);
@@ -298,7 +310,7 @@ describe("native GitHub repository routing", () => {
       return Effect.gen(function* () {
         const prs = yield* GitHubPullRequestApi.GitHubPullRequestApi;
         const api = yield* GitHubApi.GitHubRest;
-        yield* api.credential("github.com", "OwnerB/Repo");
+        yield* api.credential("github.com", { repository: "OwnerB/Repo" });
         const ref = { cwd: "/w", host: "github.com", repository: "OwnerA/Repo", number: 1 };
         const error = yield* prs
           .withVerifiedCredential(ref, () =>
@@ -317,12 +329,16 @@ describe("native GitHub repository routing", () => {
           "Bearer fake-gh-1",
         ]);
         rotate();
-        expect(Redacted.value((yield* api.credential("github.com", "OwnerA/Repo")).token)).toBe(
-          "fake-gh-2",
-        );
-        expect(Redacted.value((yield* api.credential("github.com", "OwnerB/Repo")).token)).toBe(
-          "fake-OwnerB-1",
-        );
+        expect(
+          Redacted.value(
+            (yield* api.credential("github.com", { repository: "OwnerA/Repo" })).token,
+          ),
+        ).toBe("fake-gh-2");
+        expect(
+          Redacted.value(
+            (yield* api.credential("github.com", { repository: "OwnerB/Repo" })).token,
+          ),
+        ).toBe("fake-OwnerB-1");
         expect(helperPaths).toEqual(["OwnerB/Repo.git", "OwnerA/Repo.git"]);
       }).pipe(Effect.provide(layer));
     },
@@ -404,7 +420,7 @@ describe("native GitHub repository routing", () => {
         })
         .pipe(Effect.flip);
       expect(error._tag).toBe("GitHubApiRateLimitError");
-      yield* api.credential("github.com", "OwnerA/Repo");
+      yield* api.credential("github.com", { repository: "OwnerA/Repo" });
       yield* api.rest({
         host: "github.com",
         repository: "OwnerB/Repo",
@@ -432,9 +448,9 @@ describe("native GitHub repository routing", () => {
       expect(error._tag).toBe("GitHubApiResponseError");
       expect(requests).toHaveLength(1);
       rotate();
-      expect(Redacted.value((yield* api.credential("github.com", "OwnerA/Repo")).token)).toBe(
-        "fake-OwnerA-2",
-      );
+      expect(
+        Redacted.value((yield* api.credential("github.com", { repository: "OwnerA/Repo" })).token),
+      ).toBe("fake-OwnerA-2");
       expect(helperPaths).toHaveLength(2);
     }).pipe(Effect.provide(layer));
   });
@@ -459,6 +475,7 @@ describe("native GitHub repository routing", () => {
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
+            appSignedOut,
             Layer.mock(GitHubApi.GitHubRest)({}),
             TestSourceControlHost.layer({
               process: {
@@ -512,6 +529,7 @@ describe("native GitHub repository routing", () => {
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
+            appSignedOut,
             Layer.mock(GitHubApi.GitHubRest)({
               rest: (input) => {
                 expect(input).toEqual({ host: "github.com", operation: "discovery", path: "user" });
@@ -645,7 +663,8 @@ describe("native GitHub repository routing", () => {
         );
       }),
     ).pipe(Layer.provide(host));
-    const layer = GitHubApi.layerWithDependencies.pipe(
+    const layer = GitHubAppAccess.layer.pipe(
+      Layer.provideMerge(GitHubApi.layerWithDependencies),
       Layer.provideMerge(SourceControlRateLimit.layer),
       Layer.provideMerge(http),
       Layer.provideMerge(host),
@@ -766,7 +785,7 @@ describe("native GitHub repository routing", () => {
     const { layer, requests, helperPaths, refused, rotate } = harness();
     return Effect.gen(function* () {
       const api = yield* GitHubApi.GitHubRest;
-      yield* api.credential("github.com", "OwnerB/Repo");
+      yield* api.credential("github.com", { repository: "OwnerB/Repo" });
       refused.add("Bearer fake-OwnerA-1");
       const error = yield* api
         .rest({
@@ -780,12 +799,12 @@ describe("native GitHub repository routing", () => {
       expect(requests).toHaveLength(1);
       expect(requests[0]?.headers.authorization).toBe("Bearer fake-OwnerA-1");
       rotate();
-      expect(Redacted.value((yield* api.credential("github.com", "OwnerA/Repo")).token)).toBe(
-        "fake-OwnerA-2",
-      );
-      expect(Redacted.value((yield* api.credential("github.com", "OwnerB/Repo")).token)).toBe(
-        "fake-OwnerB-1",
-      );
+      expect(
+        Redacted.value((yield* api.credential("github.com", { repository: "OwnerA/Repo" })).token),
+      ).toBe("fake-OwnerA-2");
+      expect(
+        Redacted.value((yield* api.credential("github.com", { repository: "OwnerB/Repo" })).token),
+      ).toBe("fake-OwnerB-1");
       expect(helperPaths).toEqual(["OwnerB/Repo.git", "OwnerA/Repo.git", "OwnerA/Repo.git"]);
     }).pipe(Effect.provide(layer));
   });

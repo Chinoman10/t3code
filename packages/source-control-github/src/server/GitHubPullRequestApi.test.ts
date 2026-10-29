@@ -24,6 +24,14 @@ import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSour
 import * as GitHubPullRequestApi from "./GitHubPullRequestApi.ts";
 import * as GitHubPullRequestProvider from "./GitHubPullRequestProvider.ts";
 import { KnownWorkflowRuns } from "./gitHubConditionalChecks.ts";
+import * as GitHubAppAccess from "./GitHubAppAccess.ts";
+import * as GitHubAppSignIn from "./GitHubAppSignIn.ts";
+
+const appSignedOut = Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+  enabled: false,
+  token: () => Effect.succeedNone,
+  invalidate: () => Effect.void,
+});
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -63,6 +71,7 @@ const coreResponse = (pullRequest: Readonly<Record<string, unknown>> = {}) => ({
         mergedAt: null,
         closedAt: null,
         isCrossRepository: false,
+        maintainerCanModify: true,
         headRepositoryOwner: null,
         headRepository: null,
         headRef: null,
@@ -115,6 +124,7 @@ const mockApi = Layer.succeed(
   GitHubRest.GitHubRest.of({
     rest: (input) => mockedExecute({ kind: "rest", ...input }),
     credential: (host) => mockedCredential(host),
+    appCredential: () => Effect.succeedNone,
   }),
 );
 
@@ -170,8 +180,10 @@ const mockHttp = Layer.succeed(
 
 const layer = it.layer(
   GitHubPullRequestApi.layer.pipe(
+    Layer.provideMerge(GitHubAppAccess.layer),
     Layer.provideMerge(mockApi),
     Layer.provideMerge(GitHubRequestPolicy.layer),
+    Layer.provideMerge(appSignedOut),
     Layer.provideMerge(GitHubQuota.layer),
     Layer.provideMerge(SourceControlRateLimit.layer),
     Layer.provideMerge(mockHttp),
@@ -179,6 +191,8 @@ const layer = it.layer(
       Layer.succeed(GitHubCredentials.GitHubCredentials, {
         get: (host) =>
           Effect.map(mockedCredential(host), (held) => ({ ...held, host, source: "gh" as const })),
+        saved: () => Effect.succeedNone,
+        fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
         invalidate: () => Effect.void,
       }),
     ),
@@ -626,6 +640,8 @@ it.effect(
               source: "gh" as const,
               fingerprint: `${host}:${activeToken.length}${activeToken.at(-1)}`,
             })),
+          saved: () => Effect.succeedNone,
+          fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
           invalidate: () => Effect.void,
         }),
       );
@@ -651,8 +667,9 @@ it.effect(
       );
       const cli = yield* GitHubPullRequestApi.make.pipe(
         Effect.provide(
-          GitHubRest.layer.pipe(
-            Layer.provideMerge(Layer.mergeAll(credentials, http)),
+          GitHubAppAccess.layer.pipe(
+            Layer.provideMerge(GitHubRest.layer),
+            Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
             Layer.provideMerge(GitHubQuota.layer),
             Layer.provideMerge(SourceControlRateLimit.layer),
             Layer.merge(TestSourceControlHost.layer()),
@@ -712,6 +729,8 @@ it.effect.each([401, 403])(
       const invalidations: Array<[string, string | undefined]> = [];
       const denied = new Set<string>();
       const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+        saved: () => Effect.succeedNone,
+        fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
         get: (hostname, repository) =>
           Effect.sync(() => {
             const token = tokens.get(repository ?? "") ?? "host-token";
@@ -762,8 +781,9 @@ it.effect.each([401, 403])(
       );
       const cli = yield* GitHubPullRequestApi.make.pipe(
         Effect.provide(
-          GitHubRest.layer.pipe(
-            Layer.provideMerge(Layer.mergeAll(credentials, http)),
+          GitHubAppAccess.layer.pipe(
+            Layer.provideMerge(GitHubRest.layer),
+            Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
             Layer.provideMerge(GitHubQuota.layer),
             Layer.provideMerge(SourceControlRateLimit.layer),
             Layer.merge(TestSourceControlHost.layer()),
@@ -842,6 +862,8 @@ it.effect("isolates same-login repository PAT fallback and retains the pin throu
     const selections: string[] = [];
     const invalidations: Array<[string, string | undefined]> = [];
     const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+      saved: () => Effect.succeedNone,
+      fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
       get: (hostname, repository) =>
         Effect.sync(() => {
           assert.ok(repository !== undefined && tokens.has(repository));
@@ -894,8 +916,9 @@ it.effect("isolates same-login repository PAT fallback and retains the pin throu
     );
     const cli = yield* GitHubPullRequestApi.make.pipe(
       Effect.provide(
-        GitHubRest.layer.pipe(
-          Layer.provideMerge(Layer.mergeAll(credentials, http)),
+        GitHubAppAccess.layer.pipe(
+          Layer.provideMerge(GitHubRest.layer),
+          Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
           Layer.provideMerge(GitHubQuota.layer),
           Layer.provideMerge(SourceControlRateLimit.layer),
           Layer.merge(TestSourceControlHost.layer()),
@@ -965,6 +988,8 @@ it.effect("pins paginated file stats to one repository credential until the next
       fingerprint: string | undefined;
     }> = [];
     const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+      saved: () => Effect.succeedNone,
+      fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
       get: (host, repository) =>
         Effect.sync(() => {
           selections.push([host, repository]);
@@ -1034,8 +1059,9 @@ it.effect("pins paginated file stats to one repository credential until the next
     );
     const cli = yield* GitHubPullRequestApi.make.pipe(
       Effect.provide(
-        GitHubRest.layer.pipe(
-          Layer.provideMerge(Layer.mergeAll(credentials, http)),
+        GitHubAppAccess.layer.pipe(
+          Layer.provideMerge(GitHubRest.layer),
+          Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
           Layer.provideMerge(GitHubQuota.layer),
           Layer.provideMerge(SourceControlRateLimit.layer),
           Layer.merge(TestSourceControlHost.layer()),
@@ -1083,6 +1109,8 @@ it.effect.each([false, true, undefined])(
       const key = { provider: SourceControlProviderKind.make("github"), host: input.host };
       const requests: string[] = [];
       const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+        saved: () => Effect.succeedNone,
+        fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
         get: (host, repository) =>
           Effect.succeed({
             host,
@@ -1128,8 +1156,9 @@ it.effect.each([false, true, undefined])(
       );
       const cli = yield* GitHubPullRequestApi.make.pipe(
         Effect.provide(
-          GitHubRest.layer.pipe(
-            Layer.provideMerge(Layer.mergeAll(credentials, http)),
+          GitHubAppAccess.layer.pipe(
+            Layer.provideMerge(GitHubRest.layer),
+            Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
             Layer.provideMerge(GitHubQuota.layer),
             Layer.provideMerge(
               Layer.succeed(SourceControlRateLimit.SourceControlRateLimit, limits),
@@ -1189,6 +1218,8 @@ it.effect.each([
       const limits = yield* SourceControlRateLimit.make;
       const requests: string[] = [];
       const credentials = Layer.succeed(GitHubCredentials.GitHubCredentials, {
+        saved: () => Effect.succeedNone,
+        fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
         get: (host, repository) =>
           Effect.succeed({
             host,
@@ -1214,8 +1245,9 @@ it.effect.each([
       );
       const cli = yield* GitHubPullRequestApi.make.pipe(
         Effect.provide(
-          GitHubRest.layer.pipe(
-            Layer.provideMerge(Layer.mergeAll(credentials, http)),
+          GitHubAppAccess.layer.pipe(
+            Layer.provideMerge(GitHubRest.layer),
+            Layer.provideMerge(Layer.mergeAll(credentials, http, appSignedOut)),
             Layer.provideMerge(GitHubQuota.layer),
             Layer.provideMerge(
               Layer.succeed(SourceControlRateLimit.SourceControlRateLimit, limits),
@@ -1277,6 +1309,25 @@ it.effect.each([
 );
 
 layer("GitHubPullRequestApi.layer", (it) => {
+  it.effect("turns maintainer edits off without rewriting the pull request's text", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockImplementation((call) =>
+        Effect.succeed(
+          output(
+            encodeJson(
+              call.kind === "graphql" && matches(call, NODE_ID_QUERY) ? nodeIdAnswer("PR_7") : {},
+            ),
+          ),
+        ),
+      );
+      const api = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      yield* api.updatePullRequest({ ...pullRequestInput, maintainerCanModify: false });
+      expect(variablesOf("mutation UpdatePullRequest")).toEqual([
+        { pullRequestId: "PR_7", maintainerCanModify: false },
+      ]);
+    }),
+  );
+
   it.effect.each(["mixed", "merges", "unavailable"] as const)(
     "reads stats only for displayed non-merge commits (%s)",
     (kind) =>

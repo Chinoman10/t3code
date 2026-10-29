@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   gitHubApiHostForRemote,
   resolveGitHubRepository,
+  parseGitHubRepositorySelector,
   selectGitHubBaseRepository,
 } from "./gitHubRepositoryResolution.ts";
 
@@ -135,5 +136,24 @@ describe("repository credential selector spelling", () => {
       resolveGitHubRepository({ ...input, preserveRepositoryCase: true }).locator,
       { host: "github.com", owner: "OwnerA", name: "Repo" },
     );
+  });
+});
+
+describe("parseGitHubRepositorySelector", () => {
+  it("reads host/owner/name only when the host is a plain hostname", () => {
+    assert.deepStrictEqual(parseGitHubRepositorySelector("GHE.corp:8443/acme/web", "github.com"), {
+      host: "ghe.corp:8443",
+      owner: "acme",
+      name: "web",
+    });
+    for (const selector of [
+      "evil.com#.ghe.com/acme/web",
+      "evil.com?.ghe.com/acme/web",
+      "token@evil.com/acme/web",
+      "evil.com\\.ghe.com/acme/web",
+      "-evil.com/acme/web",
+    ]) {
+      assert.strictEqual(parseGitHubRepositorySelector(selector, "github.com"), null, selector);
+    }
   });
 });

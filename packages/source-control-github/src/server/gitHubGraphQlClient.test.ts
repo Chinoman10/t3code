@@ -14,14 +14,22 @@ import * as GitHubCredentials from "./GitHubCredentials.ts";
 import * as GitHubGraphQlClient from "./gitHubGraphQlClient.ts";
 import * as GitHubQuota from "./GitHubQuota.ts";
 import { PullRequestBatchesGraphQLGroup } from "./pullRequestBatches.graphql.ts";
+import * as GitHubAppSignIn from "./GitHubAppSignIn.ts";
+
+const appSignedOut = Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+  enabled: false,
+  token: () => Effect.succeedNone,
+  invalidate: () => Effect.void,
+});
 
 const NOW = Date.parse("2026-10-05T12:00:00.000Z");
 
 function harness(
   respond: (request: HttpClientRequest.HttpClientRequest) => Response,
-  tokenForRepository?: (repository: string | undefined) => string,
+  options?: { readonly appToken?: string } | ((repository: string | undefined) => string),
 ) {
   const selections: Array<string | undefined> = [];
+  const tokenForRepository = typeof options === "function" ? options : undefined;
   const requests: Array<HttpClientRequest.HttpClientRequest> = [];
   let invalidations = 0;
   const services = Layer.mergeAll(
@@ -37,6 +45,8 @@ function harness(
             fingerprint: `${host}:${token}`,
           };
         }),
+      saved: () => Effect.succeedNone,
+      fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
       invalidate: () =>
         Effect.sync(() => {
           invalidations++;
@@ -51,6 +61,13 @@ function harness(
     ),
     GitHubQuota.layer,
     SourceControlRateLimit.layer,
+    typeof options === "function" || options?.appToken === undefined
+      ? appSignedOut
+      : Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+          enabled: true,
+          token: () => Effect.succeedSome(options.appToken ?? ""),
+          invalidate: () => Effect.void,
+        }),
   );
   const layer = GitHubRest.layer.pipe(Layer.provideMerge(services));
   return { layer, requests, selections, invalidations: () => invalidations };
@@ -109,6 +126,26 @@ describe("GitHubGraphQlAuth", () => {
       ),
       Effect.provide(layer),
     );
+  });
+
+  it.effect("asks again with the user's own credential when the app token gets NOT_FOUND", () => {
+    const { layer, requests } = harness(
+      (request) =>
+        request.headers["authorization"] === "Bearer app-token"
+          ? json({
+              data: { _0_repository: null },
+              errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }],
+            })
+          : json({ data: { _0_repository: { pullRequest: stats } } }),
+      { appToken: "app-token" },
+    );
+    return Effect.gen(function* () {
+      expect(yield* readStats("github.com")).toEqual({ repository: { pullRequest: stats } });
+      expect(requests.map((request) => request.headers["authorization"])).toEqual([
+        "Bearer app-token",
+        "Bearer secret",
+      ]);
+    }).pipe(Effect.provide(layer));
   });
 
   it.effect(

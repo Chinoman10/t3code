@@ -1687,7 +1687,7 @@ export const make = Effect.gen(function* () {
         {
           cwd: project.project.workspaceRoot,
           host: project.host,
-          ...(useGitCredentials ? { repository: providerRepository(project) } : {}),
+          repository: providerRepository(project),
         },
         (identity) =>
           identity.accountId === input.expectedAccountId
@@ -1708,7 +1708,7 @@ export const make = Effect.gen(function* () {
       .getRoutingIdentity({
         cwd: project.project.workspaceRoot,
         host: project.host,
-        ...(useGitCredentials ? { repository: providerRepository(project) } : {}),
+        repository: providerRepository(project),
       })
       .pipe(Effect.mapError(toPullRequestError("routeIdentity")));
     if (!identity.viewer.trim() || !identity.accountId.trim()) {
@@ -1877,6 +1877,9 @@ export const make = Effect.gen(function* () {
             ...(changeRequest.autoMergeMethod === undefined
               ? {}
               : { autoMergeMethod: changeRequest.autoMergeMethod }),
+            ...(changeRequest.maintainerCanModify === undefined
+              ? {}
+              : { maintainerCanModify: changeRequest.maintainerCanModify }),
             ...(changeRequest.workflowApprovalsRequired === undefined
               ? {}
               : { workflowApprovalsRequired: changeRequest.workflowApprovalsRequired }),
@@ -2200,7 +2203,7 @@ export const make = Effect.gen(function* () {
                 {
                   cwd: project.project.workspaceRoot,
                   host: project.host,
-                  ...(useGitCredentials ? { repository: providerRepository(project) } : {}),
+                  repository: providerRepository(project),
                 },
                 () => operation.pipe(Effect.result),
               )
@@ -2269,7 +2272,22 @@ export const make = Effect.gen(function* () {
             }),
           );
         }
-        if (input.title === undefined && input.body === undefined) {
+        if (
+          input.maintainerCanModify !== undefined &&
+          project.api.capabilities.edit?.maintainerEdits !== true
+        ) {
+          return Effect.fail(
+            new PullRequestOperationError({
+              operation: "update",
+              detail: "This host does not support maintainer edits.",
+            }),
+          );
+        }
+        if (
+          input.title === undefined &&
+          input.body === undefined &&
+          input.maintainerCanModify === undefined
+        ) {
           return Effect.fail(
             new PullRequestOperationError({
               operation: "update",
@@ -2282,6 +2300,9 @@ export const make = Effect.gen(function* () {
           repository: providerRepository(project),
           host: project.host,
           number: input.number,
+          ...(input.maintainerCanModify === undefined
+            ? {}
+            : { maintainerCanModify: input.maintainerCanModify }),
           ...(input.title === undefined ? {} : { title: input.title }),
           ...(input.body === undefined ? {} : { body: input.body }),
         }).pipe(Effect.mapError(toPullRequestError("update")));
@@ -2834,14 +2855,9 @@ export const make = Effect.gen(function* () {
           },
         }),
       );
-    const serveHeld = (
-      key: string,
-      effect: Effect.Effect<A, PullRequestError>,
-      mode: "reuse" | "revalidate",
-    ) => {
+    const serveHeld = (key: string, effect: Effect.Effect<A, PullRequestError>) => {
       const snapshot = held.get(key);
       if (snapshot === undefined) return read(key, effect);
-      if (mode === "reuse") return Effect.succeed(snapshot.value);
       return revalidate(read(key, effect)).pipe(Effect.as(snapshot.value));
     };
     return { peek: (key: string) => held.get(key)?.value, read, record, serveHeld };
@@ -3320,7 +3336,7 @@ export const make = Effect.gen(function* () {
     );
     return input.allowStale === false
       ? read.pipe(Effect.tap((value) => lastGoodDetail.record(key, value)))
-      : lastGoodDetail.serveHeld(key, read, "revalidate");
+      : lastGoodDetail.serveHeld(key, read);
   };
 
   const activityCache = yield* Cache.makeWith(
